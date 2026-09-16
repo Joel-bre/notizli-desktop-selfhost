@@ -3,12 +3,20 @@ const path = require("path");
 const fs = require("fs");
 const { autoUpdater } = require("electron-updater");
 
-// Edit if your dashboard moves.
-const CALLCAP_BASE_URL = "https://callcap.quietly.ch";
-const PAIR_ENDPOINT = `${CALLCAP_BASE_URL}/api/public/recorder/pair`;
-const UPLOAD_ENDPOINT = `${CALLCAP_BASE_URL}/api/public/recorder/upload`;
+// Where this recorder uploads. Override at build/run time with
+// NOTIZLI_BASE_URL=https://example.test so the next domain move is a rebuild
+// rather than a code edit.
+const NOTIZLI_BASE_URL = process.env.NOTIZLI_BASE_URL || "https://notizli.ch";
+const PAIR_ENDPOINT = `${NOTIZLI_BASE_URL}/api/public/recorder/pair`;
+const UPLOAD_ENDPOINT = `${NOTIZLI_BASE_URL}/api/public/recorder/upload`;
 
-const PROTOCOL = "callcap-sh";
+// Hosts this app used to talk to. They still resolve, but only as a 301 to
+// notizli.ch — and a 301 turns our POST into a bodyless GET and strips the
+// bearer token, so a stored URL on one of these must be rewritten, not
+// followed. See resolveUploadUrl().
+const LEGACY_HOSTS = new Set(["callcap.quietly.ch"]);
+
+const PROTOCOL = "notizli-sh";
 
 // --- single-instance + protocol registration -----------------------------
 
@@ -61,6 +69,20 @@ function writeConfig(cfg) {
   fs.mkdirSync(path.dirname(configPath()), { recursive: true });
   fs.writeFileSync(configPath(), JSON.stringify(cfg, null, 2));
 }
+// The pairing response carries an absolute upload_url which we persist. A
+// device paired before the notizli.ch move has one pointing at the old host;
+// rewrite it onto the current origin, keeping whatever path the server chose.
+function resolveUploadUrl(storedUrl) {
+  if (!storedUrl) return UPLOAD_ENDPOINT;
+  try {
+    const u = new URL(storedUrl);
+    if (LEGACY_HOSTS.has(u.hostname)) return `${NOTIZLI_BASE_URL}${u.pathname}${u.search}`;
+    return storedUrl;
+  } catch {
+    return UPLOAD_ENDPOINT;
+  }
+}
+
 function getDeviceToken() {
   const cfg = readConfig();
   if (!cfg.device_token) return null;
@@ -75,7 +97,7 @@ function createWindow() {
   mainWindow = new BrowserWindow({
     width: 480,
     height: 600,
-    title: "Callcap Self-Hosted",
+    title: "Notizli Self-Hosted",
     webPreferences: {
       preload: path.join(__dirname, "preload.cjs"),
       contextIsolation: true,
@@ -132,7 +154,7 @@ async function exchangePairingToken(pairingToken) {
   const json = await res.json();
   const cfg = readConfig();
   cfg.device_token = encryptSecret(json.device_token);
-  cfg.upload_url = json.upload_url || UPLOAD_ENDPOINT;
+  cfg.upload_url = resolveUploadUrl(json.upload_url);
   cfg.label = json.label;
   cfg.paired_at = new Date().toISOString();
   writeConfig(cfg);
@@ -182,10 +204,10 @@ ipcMain.handle("get-status", () => {
   };
 });
 
-ipcMain.handle("open-dashboard", () => shell.openExternal(`${CALLCAP_BASE_URL}/pair`));
+ipcMain.handle("open-dashboard", () => shell.openExternal(`${NOTIZLI_BASE_URL}/pair`));
 ipcMain.handle("open-meeting", (_e, meetingId) => {
   if (typeof meetingId === "string" && meetingId) {
-    return shell.openExternal(`${CALLCAP_BASE_URL}/meetings/${encodeURIComponent(meetingId)}`);
+    return shell.openExternal(`${NOTIZLI_BASE_URL}/meetings/${encodeURIComponent(meetingId)}`);
   }
 });
 ipcMain.handle("unpair", () => { writeConfig({}); return true; });
@@ -208,7 +230,7 @@ ipcMain.handle("upload-recording", async (_e, { buffer, mimeType, title, started
   if (!token) throw new Error("Not paired — pair this device first.");
 
   const cfg = readConfig();
-  const uploadUrl = cfg.upload_url || UPLOAD_ENDPOINT;
+  const uploadUrl = resolveUploadUrl(cfg.upload_url);
 
   const form = new FormData();
   const blob = new Blob([Buffer.from(buffer)], { type: mimeType || "audio/webm" });

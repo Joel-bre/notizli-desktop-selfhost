@@ -1,6 +1,6 @@
 const { contextBridge, ipcRenderer } = require("electron");
 
-contextBridge.exposeInMainWorld("callcap", {
+contextBridge.exposeInMainWorld("notizli", {
   getStatus: () => ipcRenderer.invoke("get-status"),
   openDashboard: () => ipcRenderer.invoke("open-dashboard"),
   openMeeting: (meetingId) => ipcRenderer.invoke("open-meeting", meetingId),

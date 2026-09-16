@@ -1,9 +1,9 @@
 {
-  "name": "callcap-desktop-selfhost",
-  "version": "1.0.1",
-  "description": "Callcap desktop recorder",
+  "name": "notizli-desktop-selfhost",
+  "version": "1.1.0",
+  "description": "Notizli desktop recorder",
   "main": "src/main.cjs",
-  "author": "Callcap",
+  "author": "Notizli",
   "license": "UNLICENSED",
   "private": true,
   "scripts": {
@@ -22,8 +22,8 @@
     "electron-updater": "^6.8.9"
   },
   "build": {
-    "appId": "app.callcap.recorder.selfhost",
-    "productName": "Callcap Self-Hosted",
+    "appId": "app.notizli.recorder.selfhost",
+    "productName": "Notizli Self-Hosted",
     "asar": true,
     "directories": {
       "buildResources": "build"
@@ -34,9 +34,9 @@
     ],
     "protocols": [
       {
-        "name": "Callcap Self-Hosted",
+        "name": "Notizli Self-Hosted",
         "schemes": [
-          "callcap-sh"
+          "notizli-sh"
         ]
       }
     ],
@@ -56,7 +56,7 @@
           ]
         }
       ],
-      "artifactName": "Callcap-SelfHosted.${ext}",
+      "artifactName": "Notizli-SelfHosted.${ext}",
       "icon": "build/icon.png",
       "hardenedRuntime": true,
       "gatekeeperAssess": false,
@@ -64,8 +64,8 @@
       "entitlementsInherit": "build/entitlements.mac.plist",
       "notarize": true,
       "extendInfo": {
-        "NSMicrophoneUsageDescription": "Callcap records your microphone to transcribe and summarize your meetings.",
-        "NSScreenCaptureUsageDescription": "Callcap captures system audio so it can transcribe the other participants in your meetings."
+        "NSMicrophoneUsageDescription": "Notizli records your microphone to transcribe and summarize your meetings.",
+        "NSScreenCaptureUsageDescription": "Notizli captures system audio so it can transcribe the other participants in your meetings."
       }
     },
     "win": {
@@ -77,7 +77,7 @@
           ]
         }
       ],
-      "artifactName": "Callcap-Setup.${ext}",
+      "artifactName": "Notizli-Setup.${ext}",
       "icon": "build/icon.png",
       "signAndEditExecutable": false
     },
@@ -90,7 +90,7 @@
     "publish": {
       "provider": "github",
       "owner": "Joel-bre",
-      "repo": "callcap-desktop-selfhost",
+      "repo": "notizli-desktop-selfhost",
       "releaseType": "release"
     }
   }

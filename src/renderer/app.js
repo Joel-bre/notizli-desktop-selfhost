@@ -1,5 +1,5 @@
 /**
- * Callcap desktop recorder — renderer.
+ * Notizli desktop recorder — renderer.
  *
  * Capture model mirrors the web recorder (src/lib/recorder/capture.ts):
  * mic and system audio are summed to true mono individually, then merged into
@@ -218,7 +218,7 @@ async function startRecording() {
   try {
     micStream = await navigator.mediaDevices.getUserMedia({ audio: micConstraints });
   } catch {
-    return fail("Microphone unavailable", "Callcap couldn't open the microphone. Check macOS → Privacy & Security → Microphone, then try again.");
+    return fail("Microphone unavailable", "Notizli couldn't open the microphone. Check macOS → Privacy & Security → Microphone, then try again.");
   }
   void listDevices();
 
@@ -294,7 +294,7 @@ async function uploadPending() {
   try {
     const buffer = await pendingUpload.blob.arrayBuffer();
     const title = nameInput.value.trim() || defaultName(new Date(startedAtIso));
-    const res = await window.callcap.uploadRecording({
+    const res = await window.notizli.uploadRecording({
       buffer,
       mimeType: pendingUpload.mimeType,
       title,
@@ -323,7 +323,7 @@ async function submitToken() {
   if (!t) { tokenMsg.textContent = "Paste a token first."; tokenMsg.hidden = false; return; }
   const btn = $("submit-token-btn");
   btn.disabled = true; btn.textContent = "Pairing…";
-  const r = await window.callcap.pairWithToken(t);
+  const r = await window.notizli.pairWithToken(t);
   btn.disabled = false; btn.textContent = "Pair with token";
   tokenMsg.hidden = false;
   if (r && r.ok) {
@@ -338,9 +338,9 @@ async function submitToken() {
 }
 
 // ---- wiring ---------------------------------------------------------
-$("pair-btn").addEventListener("click", () => window.callcap.openDashboard());
+$("pair-btn").addEventListener("click", () => window.notizli.openDashboard());
 $("submit-token-btn").addEventListener("click", () => void submitToken());
-$("unpair-btn").addEventListener("click", async () => { await window.callcap.unpair(); void refresh(); });
+$("unpair-btn").addEventListener("click", async () => { await window.notizli.unpair(); void refresh(); });
 $("record-btn").addEventListener("click", () => void startRecording());
 $("stop-btn").addEventListener("click", () => {
   if (mediaRecorder && mediaRecorder.state === "recording") {
@@ -357,7 +357,7 @@ $("discard-btn").addEventListener("click", () => {
   chunks = [];
   void refresh();
 });
-$("open-meeting-btn").addEventListener("click", () => { if (lastMeetingId) window.callcap.openMeeting(lastMeetingId); });
+$("open-meeting-btn").addEventListener("click", () => { if (lastMeetingId) window.notizli.openMeeting(lastMeetingId); });
 $("record-another-btn").addEventListener("click", () => { nameEdited = false; void refresh(); });
 $("error-retry-btn").addEventListener("click", () => {
   if (pendingUpload) void uploadPending();
@@ -366,7 +366,7 @@ $("error-retry-btn").addEventListener("click", () => {
 
 // ---- status poll ---------------------------------------------------
 async function refresh() {
-  const s = await window.callcap.getStatus();
+  const s = await window.notizli.getStatus();
   versionEl.textContent = "v" + s.version;
   paired = Boolean(s.paired);
   if (!paired) { show("unpaired"); return; }
@@ -376,7 +376,7 @@ async function refresh() {
   if (!active) { refreshDefaultName(); show("idle"); }
 }
 
-window.callcap.onPaired(() => { void refresh(); void listDevices(); });
+window.notizli.onPaired(() => { void refresh(); void listDevices(); });
 void refresh();
 void listDevices();
 navigator.mediaDevices.addEventListener("devicechange", listDevices);

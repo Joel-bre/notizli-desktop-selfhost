@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta http-equiv="Content-Security-Policy" content="default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self'; media-src 'self' blob:" />
-  <title>Callcap</title>
+  <title>Notizli</title>
   <style>
     @font-face {
       font-family: "Space Grotesk";
@@ -215,13 +215,13 @@
   </style>
 </head>
 <body>
-  <div class="brand">Callcap<span class="accent">.</span><span class="tag">desktop recorder</span></div>
+  <div class="brand">Notizli<span class="accent">.</span><span class="tag">desktop recorder</span></div>
 
   <!-- ============ NOT PAIRED ============ -->
   <section class="frame" id="s-unpaired">
     <h2>Connect this app to your account</h2>
     <p class="muted">
-      Recordings are transcribed into minutes and action items on your Callcap account,
+      Recordings are transcribed into minutes and action items on your Notizli account,
       so pair this device first.
     </p>
     <button class="primary block" id="pair-btn">Pair with my account</button>
@@ -231,7 +231,7 @@
     <button class="block" id="submit-token-btn" style="margin-top:10px">Pair with token</button>
     <p class="muted" id="token-msg" hidden></p>
     <p class="fineprint">
-      Open <code>callcap.quietly.ch/pair</code> in your browser, generate a token, and paste it above.
+      Open <code>notizli.ch/pair</code> in your browser, generate a token, and paste it above.
     </p>
   </section>
 
@@ -240,7 +240,7 @@
     <div class="paired-row"><span class="dot ok"></span><span id="paired-label">Paired</span></div>
     <h2>Record this meeting</h2>
     <p class="muted">
-      Callcap records the other side from your system audio and your own voice from the
+      Notizli records the other side from your system audio and your own voice from the
       microphone — the two sides kept on separate channels of the same file.
     </p>
 
@@ -258,7 +258,7 @@
 
     <p class="fineprint">
       The first time you record, macOS asks for <span style="color:var(--ink)">Microphone</span> and
-      <span style="color:var(--ink)">Screen&nbsp;Recording</span> — Screen Recording is how Callcap hears the other side.
+      <span style="color:var(--ink)">Screen&nbsp;Recording</span> — Screen Recording is how Notizli hears the other side.
     </p>
   </section>
 

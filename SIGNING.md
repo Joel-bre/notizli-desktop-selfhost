@@ -5,12 +5,12 @@ The Windows build ships unsigned today (users click through the SmartScreen
 the five secrets below are present, because Apple requires a Developer ID
 certificate to sign and notarize. Once these repository secrets exist, the
 `macos` job in `.github/workflows/release.yml` runs automatically and produces
-a signed, notarized `Callcap-SelfHosted.zip` (+ `.dmg`).
+a signed, notarized `Notizli-SelfHosted.zip` (+ `.dmg`).
 
 ## Required GitHub repository secrets
 
 Add these under **Settings → Secrets and variables → Actions** on
-`Joel-bre/callcap-desktop-selfhost`:
+`Joel-bre/notizli-desktop-selfhost`:
 
 | Secret | What it is |
 | --- | --- |
