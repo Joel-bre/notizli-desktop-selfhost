@@ -4,6 +4,11 @@ on:
   push:
     tags:
       - 'v*'
+  # Run from the Actions tab (or the API) to release main as it stands:
+  # electron-builder creates the v<package.json version> release and its tag.
+  # Bump package.json first — publishing an existing version adds to that
+  # release instead of making a new one.
+  workflow_dispatch: {}
 
 # electron-builder needs to create the GitHub Release and upload assets.
 permissions:
