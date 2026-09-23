@@ -340,7 +340,7 @@ async function submitToken() {
 // ---- wiring ---------------------------------------------------------
 $("pair-btn").addEventListener("click", () => window.notizli.openDashboard());
 $("submit-token-btn").addEventListener("click", () => void submitToken());
-$("unpair-btn").addEventListener("click", async () => { await window.notizli.unpair(); void refresh(); });
+$("unpair-btn").addEventListener("click", async () => { await window.notizli.unpair(); void refresh({ force: true }); });
 $("record-btn").addEventListener("click", () => void startRecording());
 $("stop-btn").addEventListener("click", () => {
   if (mediaRecorder && mediaRecorder.state === "recording") {
@@ -355,29 +355,35 @@ $("discard-btn").addEventListener("click", () => {
   }
   teardownAudio();
   chunks = [];
-  void refresh();
+  pendingUpload = null;
+  nameEdited = false;
+  void refresh({ force: true });
 });
 $("open-meeting-btn").addEventListener("click", () => { if (lastMeetingId) window.notizli.openMeeting(lastMeetingId); });
-$("record-another-btn").addEventListener("click", () => { nameEdited = false; void refresh(); });
+$("record-another-btn").addEventListener("click", () => { nameEdited = false; void refresh({ force: true }); });
 $("error-retry-btn").addEventListener("click", () => {
   if (pendingUpload) void uploadPending();
-  else void refresh();
+  else void refresh({ force: true });
 });
 
 // ---- status poll ---------------------------------------------------
-async function refresh() {
+//
+// force=true means the user asked to go back to the idle screen (Record
+// another / Discard / Back). Without it we only land on idle when nothing
+// else is on screen, so a background poll can't yank anyone out of a
+// recording, an upload, or an error they haven't read yet.
+async function refresh({ force = false } = {}) {
   const s = await window.notizli.getStatus();
   versionEl.textContent = "v" + s.version;
   paired = Boolean(s.paired);
   if (!paired) { show("unpaired"); return; }
   pairedLabel.textContent = s.label ? `Paired — ${s.label}` : "Paired";
-  // Don't yank the user out of an active recording on a poll tick.
   const active = ["s-recording", "s-starting", "s-done", "s-error"].some((id) => !$(id).hidden);
-  if (!active) { refreshDefaultName(); show("idle"); }
+  if (force || !active) { refreshDefaultName(); show("idle"); }
 }
 
 window.notizli.onPaired(() => { void refresh(); void listDevices(); });
 void refresh();
 void listDevices();
 navigator.mediaDevices.addEventListener("devicechange", listDevices);
-setInterval(refresh, 3000);
+setInterval(() => void refresh(), 3000);
