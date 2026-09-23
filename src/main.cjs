@@ -9,6 +9,7 @@ const { autoUpdater } = require("electron-updater");
 // rather than a code edit.
 const NOTIZLI_BASE_URL = process.env.NOTIZLI_BASE_URL || "https://notizli.ch";
 const PAIR_ENDPOINT = `${NOTIZLI_BASE_URL}/api/public/recorder/pair`;
+const PAIR_PREVIEW_ENDPOINT = `${NOTIZLI_BASE_URL}/api/public/recorder/pair-preview`;
 const UPLOAD_ENDPOINT = `${NOTIZLI_BASE_URL}/api/public/recorder/upload`;
 
 // Hosts this app used to talk to. They still resolve, but only as a 301 to
@@ -286,11 +287,34 @@ async function exchangePairingToken(pairingToken) {
   return { label: json.label };
 }
 
+// Which account a pairing token belongs to, without using it up. Throws a
+// user-facing error for a dead token. `email` is null only when the server
+// predates the preview endpoint (or can't be reached), so pairing still works
+// against an older server, just without the address to check.
+async function previewPairingToken(pairingToken) {
+  let res;
+  try {
+    res = await fetch(PAIR_PREVIEW_ENDPOINT, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ pairing_token: pairingToken }),
+    });
+  } catch {
+    return { email: null };
+  }
+  const isJson = (res.headers.get("content-type") || "").includes("json");
+  const body = isJson ? await res.json().catch(() => ({})) : {};
+  if (res.ok) return { email: typeof body.email === "string" ? body.email : null };
+  if (isJson) throw new Error(body.error || "This pairing link can't be used. Start pairing again.");
+  return { email: null };
+}
+
 // Any web page can open a notizli-sh://pair link, not only notizli.ch/pair,
-// so a link never pairs silently. Switching an already-paired recorder to
-// another account defaults to Cancel: otherwise someone else's link could
-// route your next meetings to their account.
-async function confirmPairingFromLink() {
+// and anyone can talk someone into pasting a token, so pairing never happens
+// silently. The dialog names the account the recordings would go to, and
+// defaults to Cancel: otherwise someone else's link could route your next
+// meetings to their account.
+async function confirmPairing(email, source) {
   if (recordingActive) {
     await showMessageBox({
       type: "info",
@@ -301,29 +325,34 @@ async function confirmPairingFromLink() {
     return false;
   }
   const cfg = readConfig();
-  const onlyIf = "Only continue if you just clicked \u201cPair this device\u201d on notizli.ch yourself.";
+  const account = email ? `\u201c${email}\u201d` : "a Notizli account";
+  const onlyIf = email
+    ? "Only continue if that is your own account."
+    : source === "link"
+      ? "Only continue if you just clicked \u201cPair this device\u201d on notizli.ch yourself."
+      : "Only continue if you generated this token on notizli.ch yourself.";
   if (cfg.device_token) {
     const { response } = await showMessageBox({
       type: "warning",
       buttons: ["Cancel", "Switch account"],
       defaultId: 0,
       cancelId: 0,
-      message: "Switch this recorder to another account?",
+      message: email ? `Switch this recorder to ${email}?` : "Switch this recorder to another account?",
       detail:
-        `It is paired${cfg.label ? ` as \u201c${cfg.label}\u201d` : ""}. A link is asking to pair it with a ` +
-        `Notizli account, and recordings made after this would upload there.\n\n${onlyIf}`,
+        `It is paired${cfg.label ? ` as \u201c${cfg.label}\u201d` : ""}. Recordings made after this ` +
+        `would upload to ${account}.\n\n${onlyIf}`,
     });
     return response === 1;
   }
   const { response } = await showMessageBox({
     type: "question",
-    buttons: ["Pair", "Cancel"],
+    buttons: ["Cancel", "Pair"],
     defaultId: 0,
-    cancelId: 1,
-    message: "Pair this recorder with your Notizli account?",
-    detail: onlyIf,
+    cancelId: 0,
+    message: email ? `Pair this recorder with ${email}?` : "Pair this recorder with your Notizli account?",
+    detail: `Recordings made on this computer will upload to ${account}.\n\n${onlyIf}`,
   });
-  return response === 0;
+  return response === 1;
 }
 
 async function handleProtocolUrl(url) {
@@ -340,7 +369,8 @@ async function handleProtocolUrl(url) {
   // dialog can be shown until it is.
   await app.whenReady();
   try {
-    if (!(await confirmPairingFromLink())) return;
+    const { email } = await previewPairingToken(token);
+    if (!(await confirmPairing(email, "link"))) return;
     await exchangePairingToken(token);
   } catch (err) {
     dialog.showErrorBox("Pairing failed", String((err && err.message) || err));
@@ -384,7 +414,10 @@ ipcMain.handle("open-meeting", (_e, meetingId) => {
 ipcMain.handle("unpair", () => { writeConfig({}); return true; });
 ipcMain.handle("pair-with-token", async (_e, token) => {
   try {
-    const r = await exchangePairingToken(String(token || "").trim());
+    const t = String(token || "").trim();
+    const { email } = await previewPairingToken(t);
+    if (!(await confirmPairing(email, "paste"))) return { ok: false, error: "Pairing cancelled." };
+    const r = await exchangePairingToken(t);
     return { ok: true, label: r.label };
   } catch (err) {
     return { ok: false, error: String((err && err.message) || err) };
