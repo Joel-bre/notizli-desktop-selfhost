@@ -158,6 +158,16 @@
       margin-bottom: 14px;
     }
     .dot { width: 7px; height: 7px; border-radius: 50%; background: var(--ink-muted); flex: none; }
+
+    .unsent {
+      display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between;
+      gap: 6px 14px;
+      margin-bottom: 14px; padding: 10px 12px;
+      border: 1px solid var(--signal);
+      font-size: 12.5px; color: var(--ink);
+    }
+    .unsent-actions { display: inline-flex; gap: 14px; }
+    #error-msg { overflow-wrap: anywhere; }
     .dot.ok { background: var(--signal); }
 
     .row-head {
@@ -238,6 +248,13 @@
   <!-- ============ IDLE (paired, ready) ============ -->
   <section class="frame" id="s-idle" hidden>
     <div class="paired-row"><span class="dot ok"></span><span id="paired-label">Paired</span></div>
+    <div class="unsent" id="unsent-row" hidden>
+      <span id="unsent-text"></span>
+      <span class="unsent-actions">
+        <button class="link" id="unsent-upload-btn">Upload now</button>
+        <button class="link" id="unsent-show-btn">Show files</button>
+      </span>
+    </div>
     <h2>Record this meeting</h2>
     <p class="muted">
       Notizli records the other side from your system audio and your own voice from the
@@ -327,8 +344,11 @@
       <div style="min-width:0">
         <h2 id="error-title">That didn't work</h2>
         <p class="muted" id="error-msg"></p>
+        <p class="muted" id="error-note" hidden></p>
         <div class="btn-group">
-          <button class="primary" id="error-retry-btn">Try again</button>
+          <button class="primary" id="error-retry-btn" hidden>Try again</button>
+          <button id="error-save-btn" hidden>Save a copy…</button>
+          <button id="error-back-btn">Back</button>
         </div>
       </div>
     </div>

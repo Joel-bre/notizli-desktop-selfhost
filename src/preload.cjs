@@ -6,9 +6,16 @@ contextBridge.exposeInMainWorld("notizli", {
   openMeeting: (meetingId) => ipcRenderer.invoke("open-meeting", meetingId),
   unpair: () => ipcRenderer.invoke("unpair"),
   pairWithToken: (token) => ipcRenderer.invoke("pair-with-token", token),
-  // buffer: ArrayBuffer of the recorded audio. The bearer token never
+  // buffer: ArrayBuffer of the recorded audio, written to disk by the main
+  // process. Resolves with the saved recording's id. The bearer token never
   // leaves the main process.
-  uploadRecording: (payload) => ipcRenderer.invoke("upload-recording", payload),
+  saveRecording: (payload) => ipcRenderer.invoke("save-recording", payload),
+  uploadSaved: (id) => ipcRenderer.invoke("upload-saved", id),
+  listUnsent: () => ipcRenderer.invoke("list-unsent"),
+  showUnsent: () => ipcRenderer.invoke("show-unsent"),
+  saveCopy: (id) => ipcRenderer.invoke("save-copy", id),
+  confirmDiscard: () => ipcRenderer.invoke("confirm-discard"),
+  setRecordingActive: (active) => ipcRenderer.send("recording-active", Boolean(active)),
   onPaired: (cb) => {
     const handler = (_e, payload) => cb(payload);
     ipcRenderer.on("paired", handler);

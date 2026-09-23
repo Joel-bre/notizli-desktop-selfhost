@@ -1,6 +1,7 @@
 const { app, BrowserWindow, ipcMain, Menu, shell, dialog, safeStorage, desktopCapturer } = require("electron");
 const path = require("path");
 const fs = require("fs");
+const crypto = require("crypto");
 const { autoUpdater } = require("electron-updater");
 
 // Where this recorder uploads. Override at build/run time with
@@ -89,9 +90,108 @@ function getDeviceToken() {
   try { return decryptSecret(cfg.device_token); } catch { return null; }
 }
 
+// --- unsent recordings ---------------------------------------------------
+//
+// Every recording is written to disk before it is uploaded and deleted only
+// once the server has accepted it. A failed upload, a quit or a crash while
+// uploading therefore never costs a meeting: whatever is still in this folder
+// is offered for upload again from the idle screen.
+
+const UNSENT_ID = /^\d{13}-[0-9a-f]{8}$/;
+const uploadsInFlight = new Map(); // id -> Promise, so a retry can't post twice
+
+function unsentDir() {
+  return path.join(app.getPath("userData"), "unsent");
+}
+function unsentPaths(id) {
+  // ids come back from the renderer; never let one name a path outside the folder
+  if (!UNSENT_ID.test(String(id))) throw new Error("Unknown recording.");
+  const dir = unsentDir();
+  return { audio: path.join(dir, `${id}.webm`), meta: path.join(dir, `${id}.json`) };
+}
+
+function saveRecording({ buffer, mimeType, title, startedAt, channelLayout }) {
+  fs.mkdirSync(unsentDir(), { recursive: true });
+  const id = `${Date.now()}-${crypto.randomBytes(4).toString("hex")}`;
+  const p = unsentPaths(id);
+  // Audio first, metadata second: the .json is what marks a recording as
+  // complete, so a crash between the two can't list a half-written file.
+  fs.writeFileSync(p.audio, Buffer.from(buffer));
+  fs.writeFileSync(p.meta, JSON.stringify({ id, mimeType, title, startedAt, channelLayout }));
+  return id;
+}
+
+function listUnsent() {
+  let names;
+  try { names = fs.readdirSync(unsentDir()); } catch { return []; }
+  return names
+    .filter((n) => n.endsWith(".json"))
+    .map((n) => {
+      try {
+        const meta = JSON.parse(fs.readFileSync(path.join(unsentDir(), n), "utf8"));
+        const size = fs.statSync(unsentPaths(meta.id).audio).size;
+        return {
+          id: meta.id,
+          title: meta.title || null,
+          startedAt: meta.startedAt || null,
+          size,
+          uploading: uploadsInFlight.has(meta.id),
+        };
+      } catch { return null; }
+    })
+    .filter(Boolean)
+    .sort((a, b) => a.id.localeCompare(b.id));
+}
+
+// POST a saved recording as multipart/form-data. The bearer token is attached
+// here and never reaches the renderer. The server starts the transcription
+// pipeline automatically on upload, so there is no separate /process call.
+async function postRecording(id) {
+  const p = unsentPaths(id);
+  const token = getDeviceToken();
+  if (!token) throw new Error("Not paired — pair this device first.");
+  const meta = JSON.parse(fs.readFileSync(p.meta, "utf8"));
+
+  const form = new FormData();
+  const blob = new Blob([fs.readFileSync(p.audio)], { type: meta.mimeType || "audio/webm" });
+  form.append("audio", blob, "recording.webm");
+  if (meta.title) form.append("title", String(meta.title));
+  if (meta.startedAt) form.append("started_at", String(meta.startedAt));
+  // 'mic_remote' = two-channel (ch0 mic / ch1 far end); anything else the
+  // server treats as 'mono'. See docs/Stereo-mono.md.
+  form.append("channel_layout", meta.channelLayout === "mic_remote" ? "mic_remote" : "mono");
+
+  const res = await fetch(resolveUploadUrl(readConfig().upload_url), {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+    body: form,
+  });
+  if (!res.ok) {
+    const err = new Error(`Upload failed (${res.status}): ${await res.text()}`);
+    err.status = res.status;
+    throw err;
+  }
+  // Accepted. Drop the local copy before reading the body, so an unparseable
+  // response can't leave it queued to be uploaded a second time.
+  fs.rmSync(p.audio, { force: true });
+  fs.rmSync(p.meta, { force: true });
+  const json = await res.json().catch(() => ({}));
+  return { meeting_id: json.meeting_id || null };
+}
+
+function uploadSaved(id) {
+  if (!uploadsInFlight.has(id)) {
+    uploadsInFlight.set(id, postRecording(id).finally(() => uploadsInFlight.delete(id)));
+  }
+  return uploadsInFlight.get(id);
+}
+
 // --- window --------------------------------------------------------------
 
 let mainWindow = null;
+// Set by the renderer while a recording exists only in memory. Pairing links
+// are refused then, so a meeting can't switch accounts halfway through.
+let recordingActive = false;
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -132,14 +232,38 @@ function createWindow() {
     { useSystemPicker: false },
   );
 
+  // While a recording isn't on disk yet the renderer cancels unload in
+  // beforeunload, which Electron does silently — so ask here. Closing the
+  // window and quitting (Cmd+Q) both arrive in this handler.
+  mainWindow.webContents.on("will-prevent-unload", (event) => {
+    const choice = dialog.showMessageBoxSync(mainWindow, {
+      type: "warning",
+      buttons: ["Cancel", "Discard and close"],
+      defaultId: 0,
+      cancelId: 0,
+      message: "This recording hasn't been saved yet",
+      detail: "Closing now throws it away. Finish the recording first — it's saved to this computer as soon as you do.",
+    });
+    if (choice === 1) event.preventDefault(); // let the unload go ahead
+  });
+
   mainWindow.loadFile(path.join(__dirname, "renderer", "index.html"));
-  mainWindow.on("closed", () => { mainWindow = null; });
+  mainWindow.on("closed", () => { mainWindow = null; recordingActive = false; });
 }
 
 function sendToRenderer(channel, payload) {
   if (mainWindow && !mainWindow.isDestroyed()) {
     mainWindow.webContents.send(channel, payload);
   }
+}
+
+// Window-modal on the recorder when it is open; free-standing otherwise (on
+// macOS a pairing link can arrive while the window is closed).
+function hasWindow() {
+  return Boolean(mainWindow && !mainWindow.isDestroyed());
+}
+function showMessageBox(opts) {
+  return hasWindow() ? dialog.showMessageBox(mainWindow, opts) : dialog.showMessageBox(opts);
 }
 
 // --- pairing flow --------------------------------------------------------
@@ -162,17 +286,64 @@ async function exchangePairingToken(pairingToken) {
   return { label: json.label };
 }
 
-function handleProtocolUrl(url) {
+// Any web page can open a notizli-sh://pair link, not only notizli.ch/pair,
+// so a link never pairs silently. Switching an already-paired recorder to
+// another account defaults to Cancel: otherwise someone else's link could
+// route your next meetings to their account.
+async function confirmPairingFromLink() {
+  if (recordingActive) {
+    await showMessageBox({
+      type: "info",
+      buttons: ["OK"],
+      message: "Finish the recording first",
+      detail: "This recorder can't be paired while a recording is in progress. Finish it, then open the pairing link again.",
+    });
+    return false;
+  }
+  const cfg = readConfig();
+  const onlyIf = "Only continue if you just clicked \u201cPair this device\u201d on notizli.ch yourself.";
+  if (cfg.device_token) {
+    const { response } = await showMessageBox({
+      type: "warning",
+      buttons: ["Cancel", "Switch account"],
+      defaultId: 0,
+      cancelId: 0,
+      message: "Switch this recorder to another account?",
+      detail:
+        `It is paired${cfg.label ? ` as \u201c${cfg.label}\u201d` : ""}. A link is asking to pair it with a ` +
+        `Notizli account, and recordings made after this would upload there.\n\n${onlyIf}`,
+    });
+    return response === 1;
+  }
+  const { response } = await showMessageBox({
+    type: "question",
+    buttons: ["Pair", "Cancel"],
+    defaultId: 0,
+    cancelId: 1,
+    message: "Pair this recorder with your Notizli account?",
+    detail: onlyIf,
+  });
+  return response === 0;
+}
+
+async function handleProtocolUrl(url) {
+  let token = null;
   try {
     const u = new URL(url);
-    if (u.host !== "pair") return;
-    const token = u.searchParams.get("token");
-    if (!token) return;
-    exchangePairingToken(token).catch((err) => {
-      dialog.showErrorBox("Pairing failed", err.message);
-    });
+    if (u.host === "pair") token = u.searchParams.get("token");
+  } catch {
+    console.error("Bad protocol URL"); // not the URL itself: it carries the token
+    return;
+  }
+  if (!token) return;
+  // On a cold start macOS delivers open-url before the app is ready, and no
+  // dialog can be shown until it is.
+  await app.whenReady();
+  try {
+    if (!(await confirmPairingFromLink())) return;
+    await exchangePairingToken(token);
   } catch (err) {
-    console.error("Bad protocol URL", url);
+    dialog.showErrorBox("Pairing failed", String((err && err.message) || err));
   }
 }
 
@@ -180,7 +351,7 @@ function handleProtocolUrl(url) {
 
 app.on("open-url", (event, url) => {
   event.preventDefault();
-  handleProtocolUrl(url);
+  void handleProtocolUrl(url);
 });
 
 app.on("second-instance", (_event, argv) => {
@@ -189,7 +360,7 @@ app.on("second-instance", (_event, argv) => {
     mainWindow.focus();
   }
   const protoArg = argv.find((a) => a.startsWith(`${PROTOCOL}://`));
-  if (protoArg) handleProtocolUrl(protoArg);
+  if (protoArg) void handleProtocolUrl(protoArg);
 });
 
 // --- IPC -----------------------------------------------------------------
@@ -220,36 +391,52 @@ ipcMain.handle("pair-with-token", async (_e, token) => {
   }
 });
 
-// Upload a recording. The renderer captures audio and hands us the raw
-// bytes; we attach the bearer token (kept out of the renderer) and POST
-// multipart/form-data to the upload endpoint. The server starts the
-// transcription pipeline automatically on upload, so there is no separate
-// /process call to make here.
-ipcMain.handle("upload-recording", async (_e, { buffer, mimeType, title, startedAt, channelLayout }) => {
-  const token = getDeviceToken();
-  if (!token) throw new Error("Not paired — pair this device first.");
+// A finished recording arrives here as raw bytes and goes to disk before
+// anything else happens; the renderer then asks for it to be uploaded by id.
+ipcMain.handle("save-recording", (_e, payload) => saveRecording(payload || {}));
 
-  const cfg = readConfig();
-  const uploadUrl = resolveUploadUrl(cfg.upload_url);
-
-  const form = new FormData();
-  const blob = new Blob([Buffer.from(buffer)], { type: mimeType || "audio/webm" });
-  form.append("audio", blob, "recording.webm");
-  if (title) form.append("title", String(title));
-  if (startedAt) form.append("started_at", String(startedAt));
-  // 'mic_remote' = two-channel (ch0 mic / ch1 far end); anything else the
-  // server treats as 'mono'. See docs/Stereo-mono.md.
-  form.append("channel_layout", channelLayout === "mic_remote" ? "mic_remote" : "mono");
-
-  const res = await fetch(uploadUrl, {
-    method: "POST",
-    headers: { Authorization: `Bearer ${token}` },
-    body: form,
-  });
-  if (!res.ok) throw new Error(`Upload failed (${res.status}): ${await res.text()}`);
-  const json = await res.json();
-  return { meeting_id: json.meeting_id };
+ipcMain.handle("upload-saved", async (_e, id) => {
+  try {
+    return { ok: true, ...(await uploadSaved(String(id))) };
+  } catch (err) {
+    return { ok: false, error: String((err && err.message) || err), status: (err && err.status) || null };
+  }
 });
+
+ipcMain.handle("list-unsent", () => listUnsent());
+
+ipcMain.handle("show-unsent", () => {
+  fs.mkdirSync(unsentDir(), { recursive: true });
+  return shell.openPath(unsentDir());
+});
+
+ipcMain.handle("save-copy", async (_e, id) => {
+  const p = unsentPaths(String(id));
+  const meta = JSON.parse(fs.readFileSync(p.meta, "utf8"));
+  const name = String(meta.title || "Notizli recording").replace(/[\\/:*?"<>|\u0000-\u001f]+/g, "-").slice(0, 120);
+  const opts = {
+    defaultPath: path.join(app.getPath("documents"), `${name}.webm`),
+    filters: [{ name: "Audio", extensions: ["webm"] }],
+  };
+  const r = hasWindow() ? await dialog.showSaveDialog(mainWindow, opts) : await dialog.showSaveDialog(opts);
+  if (r.canceled || !r.filePath) return { ok: false };
+  fs.copyFileSync(p.audio, r.filePath);
+  return { ok: true, path: r.filePath };
+});
+
+ipcMain.handle("confirm-discard", async () => {
+  const { response } = await showMessageBox({
+    type: "warning",
+    buttons: ["Keep it", "Discard"],
+    defaultId: 0,
+    cancelId: 0,
+    message: "Discard this recording?",
+    detail: "The audio is deleted and nothing is uploaded. This can't be undone.",
+  });
+  return response === 1;
+});
+
+ipcMain.on("recording-active", (_e, active) => { recordingActive = Boolean(active); });
 
 // --- lifecycle -----------------------------------------------------------
 
@@ -271,7 +458,7 @@ app.whenReady().then(() => {
 
   // Handle protocol URL passed at cold start (Windows/Linux)
   const cold = process.argv.find((a) => a.startsWith(`${PROTOCOL}://`));
-  if (cold) handleProtocolUrl(cold);
+  if (cold) void handleProtocolUrl(cold);
 
   // Auto-updates (no-op in dev)
   if (app.isPackaged) {

@@ -39,6 +39,16 @@ const micHint = $("mic-hint");
 const remHint = $("rem-hint");
 const errorTitle = $("error-title");
 const errorMsg = $("error-msg");
+const errorNote = $("error-note");
+const retryBtn = $("error-retry-btn");
+const saveCopyBtn = $("error-save-btn");
+const backBtn = $("error-back-btn");
+const stopBtn = $("stop-btn");
+const discardBtn = $("discard-btn");
+const unsentRow = $("unsent-row");
+const unsentText = $("unsent-text");
+const unsentUploadBtn = $("unsent-upload-btn");
+const unsentShowBtn = $("unsent-show-btn");
 
 function show(name) {
   for (const [k, el] of Object.entries(sections)) el.hidden = k !== name;
@@ -59,6 +69,7 @@ let startedAtIso = null;
 let channelLayout = "mono";
 let lastMeetingId = null;
 let nameEdited = false;
+let remoteHeard = false;
 
 function pad(n) { return String(n).padStart(2, "0"); }
 function fmtClock(ms) {
@@ -189,11 +200,11 @@ function startMeters() {
     micFill.style.width = `${Math.round(mic * 100)}%`;
     remFill.style.width = `${Math.round(remote * 100)}%`;
     const elapsed = (Date.now() - timerStart) / 1000;
-    if (channelLayout === "mic_remote" && remote < 0.01 && elapsed > 12) {
-      remHint.textContent = "no sound yet";
-    } else {
-      remHint.textContent = "";
-    }
+    if (remote >= 0.01) remoteHeard = true;
+    // Only while meeting audio has never produced a sound. A pause later in
+    // the conversation is normal and shouldn't look like a fault.
+    remHint.textContent =
+      channelLayout === "mic_remote" && !remoteHeard && elapsed > 12 ? "no sound yet" : "";
     meterRaf = requestAnimationFrame(tick);
   };
   meterRaf = requestAnimationFrame(tick);
@@ -248,7 +259,11 @@ async function startRecording() {
   mediaRecorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) chunks.push(e.data); };
   mediaRecorder.onstop = onRecordingStop;
   mediaRecorder.start(1000);
+  setUnsafeToClose(true);
 
+  remoteHeard = false;
+  stopBtn.hidden = false;
+  discardBtn.hidden = false;
   show("recording");
   micFill.style.width = "0%";
   remFill.style.width = "0%";
@@ -269,7 +284,47 @@ function teardownAudio() {
   mix = null;
 }
 
-let pendingUpload = null; // { blob, mimeType } kept across an upload retry
+// ---- close guard -----------------------------------------------------
+//
+// True from the moment audio is captured until it is on disk. While it is,
+// closing the window or quitting asks first (main.cjs, will-prevent-unload),
+// and pairing links are refused.
+let unsafeToClose = false;
+function setUnsafeToClose(v) {
+  unsafeToClose = v;
+  window.notizli.setRecordingActive(v);
+}
+window.addEventListener("beforeunload", (e) => {
+  if (unsafeToClose) e.returnValue = false;
+});
+
+// ---- saving + upload --------------------------------------------------
+//
+// A finished recording is written to disk by the main process first and
+// uploaded from there. It is deleted only once the server accepts it; until
+// then the idle screen offers it for upload again, so nothing is lost to a
+// failed upload, a quit or a crash.
+
+let currentId = null; // saved recording the upload / error screens are about
+let unsaved = null;   // a recording that could not be written to disk — still only in memory
+let uploadGen = 0;    // bumped whenever the upload screen is abandoned
+
+function errText(err) {
+  // ipcRenderer.invoke wraps errors as "Error invoking remote method '…': Error: …"
+  return String((err && err.message) || err).replace(/^Error invoking remote method '[^']*': (?:Error: )?/, "");
+}
+
+function showBusy(text) {
+  show("recording");
+  recPulse.style.visibility = "hidden";
+  recLabel.textContent = text;
+  recStatus.textContent = text;
+  recStatus.className = "";
+  // The recording is over: Stop and Discard must not be reachable while it
+  // saves and uploads, or a stale upload result lands on top of the next one.
+  stopBtn.hidden = true;
+  discardBtn.hidden = true;
+}
 
 async function onRecordingStop() {
   const mimeType = (mediaRecorder && mediaRecorder.mimeType) || "audio/webm";
@@ -278,43 +333,94 @@ async function onRecordingStop() {
   teardownAudio();
 
   if (blob.size === 0) {
-    return fail("Nothing was recorded", "The recording came back empty. Try again.", false);
+    setUnsafeToClose(false);
+    return fail("Nothing was recorded", "The recording came back empty. Try again.");
   }
-  pendingUpload = { blob, mimeType };
-  await uploadPending();
+  await saveAndUpload({
+    buffer: await blob.arrayBuffer(),
+    mimeType,
+    title: nameInput.value.trim() || defaultName(new Date(startedAtIso)),
+    startedAt: startedAtIso,
+    channelLayout,
+  });
 }
 
-async function uploadPending() {
-  if (!pendingUpload) return;
-  recPulse.style.visibility = "hidden";
-  show("recording");
-  recLabel.textContent = "Uploading…";
-  recStatus.textContent = "Uploading…";
-  recStatus.className = "";
+async function saveAndUpload(rec) {
+  showBusy("Saving…");
   try {
-    const buffer = await pendingUpload.blob.arrayBuffer();
-    const title = nameInput.value.trim() || defaultName(new Date(startedAtIso));
-    const res = await window.notizli.uploadRecording({
-      buffer,
-      mimeType: pendingUpload.mimeType,
-      title,
-      startedAt: startedAtIso,
-      channelLayout,
+    currentId = await window.notizli.saveRecording(rec);
+  } catch (err) {
+    unsaved = rec;
+    return fail("Couldn't save the recording", errText(err), {
+      retry: "Try again",
+      note: "It is still held in memory, so don't quit the app. If the disk is full, free up some space, then try again.",
     });
-    lastMeetingId = res && res.meeting_id;
-    pendingUpload = null;
+  }
+  unsaved = null;
+  setUnsafeToClose(false);
+  await uploadCurrent();
+}
+
+async function uploadCurrent() {
+  const gen = ++uploadGen;
+  showBusy("Uploading…");
+  let r;
+  try {
+    r = await window.notizli.uploadSaved(currentId);
+  } catch (err) {
+    // This screen has no buttons, so a throw here must still land on the
+    // error screen rather than leave "Uploading…" up forever.
+    r = { ok: false, error: errText(err) };
+  }
+  if (gen !== uploadGen) return; // the user moved on while it ran
+  if (r.ok) {
+    lastMeetingId = r.meeting_id;
+    currentId = null;
     show("done");
     $("open-meeting-btn").style.display = lastMeetingId ? "" : "none";
-  } catch (err) {
-    fail("Upload failed", (err && err.message) || "The recording is still held — try uploading again.", true);
+  } else {
+    fail("Upload failed", r.error, {
+      retry: "Try upload again",
+      saveCopy: true,
+      note:
+        "The recording is saved on this computer, so nothing is lost. If you go back, it stays queued " +
+        "and you can upload it later from the start screen.",
+    });
   }
 }
 
-function fail(title, msg, retryUpload) {
+function fail(title, msg, { retry = null, saveCopy = false, note = "" } = {}) {
   errorTitle.textContent = title;
   errorMsg.textContent = msg;
-  $("error-retry-btn").textContent = retryUpload ? "Try upload again" : "Back";
+  errorNote.textContent = note;
+  errorNote.hidden = !note;
+  retryBtn.hidden = !retry;
+  if (retry) retryBtn.textContent = retry;
+  saveCopyBtn.hidden = !saveCopy;
   show("error");
+}
+
+// ---- recordings waiting to upload ------------------------------------------
+let unsentBusy = false;
+let unsentLastError = "";
+
+async function renderUnsent() {
+  if (unsentBusy) return;
+  let list;
+  try {
+    list = await window.notizli.listUnsent();
+  } catch {
+    return; // keep whatever the banner showed; the next poll tries again
+  }
+  unsentRow.hidden = list.length === 0;
+  if (!list.length) { unsentLastError = ""; return; }
+  const n = list.length;
+  const uploading = list.some((r) => r.uploading);
+  unsentText.textContent = uploading
+    ? `Uploading ${n === 1 ? "a recording" : `${n} recordings`}…`
+    : `${n === 1 ? "1 recording hasn't" : `${n} recordings haven't`} uploaded yet.` +
+      (unsentLastError ? ` Last try failed: ${unsentLastError}.` : "");
+  unsentUploadBtn.hidden = uploading;
 }
 
 // ---- pairing ---------------------------------------------------------
@@ -348,23 +454,64 @@ $("stop-btn").addEventListener("click", () => {
     mediaRecorder.stop();
   }
 });
-$("discard-btn").addEventListener("click", () => {
-  if (mediaRecorder && mediaRecorder.state === "recording") {
-    mediaRecorder.onstop = null;
-    mediaRecorder.stop();
-  }
+$("discard-btn").addEventListener("click", async () => {
+  if (!mediaRecorder || mediaRecorder.state !== "recording") return;
+  if (!(await window.notizli.confirmDiscard())) return;
+  if (mediaRecorder.state !== "recording") return; // finished while the dialog was open
+  mediaRecorder.onstop = null;
+  mediaRecorder.stop();
   teardownAudio();
   chunks = [];
-  pendingUpload = null;
   nameEdited = false;
+  setUnsafeToClose(false);
   void refresh({ force: true });
 });
 $("open-meeting-btn").addEventListener("click", () => { if (lastMeetingId) window.notizli.openMeeting(lastMeetingId); });
 $("record-another-btn").addEventListener("click", () => { nameEdited = false; void refresh({ force: true }); });
-$("error-retry-btn").addEventListener("click", () => {
-  if (pendingUpload) void uploadPending();
-  else void refresh({ force: true });
+retryBtn.addEventListener("click", () => {
+  if (unsaved) void saveAndUpload(unsaved);
+  else if (currentId) void uploadCurrent();
 });
+saveCopyBtn.addEventListener("click", async () => {
+  if (!currentId) return;
+  try {
+    const r = await window.notizli.saveCopy(currentId);
+    if (r && r.ok) { errorNote.textContent = `Saved a copy to ${r.path}`; errorNote.hidden = false; }
+  } catch (err) {
+    errorNote.textContent = `Couldn't save a copy: ${errText(err)}`;
+    errorNote.hidden = false;
+  }
+});
+backBtn.addEventListener("click", async () => {
+  if (unsaved) {
+    // Only case where Back loses audio: it never made it to disk.
+    if (!(await window.notizli.confirmDiscard())) return;
+    unsaved = null;
+    setUnsafeToClose(false);
+  }
+  uploadGen++;
+  currentId = null; // a saved one stays queued on disk
+  void refresh({ force: true });
+});
+unsentUploadBtn.addEventListener("click", async () => {
+  unsentBusy = true;
+  unsentUploadBtn.hidden = true;
+  unsentLastError = "";
+  try {
+    const list = await window.notizli.listUnsent();
+    for (let i = 0; i < list.length; i++) {
+      unsentText.textContent = `Uploading ${i + 1} of ${list.length}…`;
+      const r = await window.notizli.uploadSaved(list[i].id);
+      if (!r.ok) unsentLastError = r.status ? `the server answered ${r.status}` : r.error;
+    }
+  } catch (err) {
+    unsentLastError = errText(err);
+  } finally {
+    unsentBusy = false; // never leave the banner frozen
+  }
+  await renderUnsent();
+});
+unsentShowBtn.addEventListener("click", () => void window.notizli.showUnsent());
 
 // ---- status poll ---------------------------------------------------
 //
@@ -380,6 +527,7 @@ async function refresh({ force = false } = {}) {
   pairedLabel.textContent = s.label ? `Paired — ${s.label}` : "Paired";
   const active = ["s-recording", "s-starting", "s-done", "s-error"].some((id) => !$(id).hidden);
   if (force || !active) { refreshDefaultName(); show("idle"); }
+  if (!sections.idle.hidden) void renderUnsent();
 }
 
 window.notizli.onPaired(() => { void refresh(); void listDevices(); });
