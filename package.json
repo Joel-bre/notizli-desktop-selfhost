@@ -1,6 +1,6 @@
 {
   "name": "notizli-desktop-selfhost",
-  "version": "1.1.1",
+  "version": "1.1.2",
   "description": "Notizli desktop recorder",
   "main": "src/main.cjs",
   "author": "Notizli",
@@ -78,8 +78,7 @@
         }
       ],
       "artifactName": "Notizli-Setup.${ext}",
-      "icon": "build/icon.png",
-      "signAndEditExecutable": false
+      "icon": "build/icon.png"
     },
     "nsis": {
       "oneClick": false,

@@ -19,7 +19,7 @@ Both can be installed side by side. Neither auto-updates the other.
 ## Cutting a release
 
 ```bash
-git tag v1.1.1
+git tag v1.1.2
 git push --tags
 ```
 
