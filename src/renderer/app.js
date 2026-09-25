@@ -27,6 +27,7 @@ const versionEl = $("version");
 const pairedLabel = $("paired-label");
 const nameInput = $("meeting-name");
 const deviceSel = $("device");
+const listeningSel = $("listening");
 const tokenInput = $("token-input");
 const tokenMsg = $("token-msg");
 const timerEl = $("timer");
@@ -341,13 +342,16 @@ async function startRecording() {
   refreshDefaultName();
 
   const deviceId = deviceSel.value;
+  // On speakers the microphone's echo canceller must stay OFF: with it on,
+  // Chromium/Windows treats the meeting audio as echo and the loopback channel
+  // goes silent (the Lovable-era recorder had it off for exactly this reason;
+  // turning it on in the self-host port is what broke Teams-on-speakers).
+  // On headphones there is no echo, so the cleanup only helps the mic.
+  const onHeadphones = listeningSel.value === "headphones";
   const micConstraints = {
-    // Match the web recorder: cancel the far end back out of the mic so a user
-    // on speakers doesn't capture the other side twice. The clean copy of the
-    // far end comes from the loopback channel, not the room.
-    echoCancellation: true,
-    noiseSuppression: true,
-    autoGainControl: true,
+    echoCancellation: onHeadphones,
+    noiseSuppression: onHeadphones,
+    autoGainControl: onHeadphones,
   };
   if (deviceId) micConstraints.deviceId = { exact: deviceId };
 
@@ -679,6 +683,14 @@ function applyPlatformCopy() {
   $("starting-title").textContent = "Starting…";
   $("starting-note").textContent = "Opening your microphone and the meeting audio.";
 }
+
+try {
+  const saved = localStorage.getItem("notizli.listening");
+  if (saved === "headphones" || saved === "speakers") listeningSel.value = saved;
+} catch { /* storage unavailable — keep the default */ }
+listeningSel.addEventListener("change", () => {
+  try { localStorage.setItem("notizli.listening", listeningSel.value); } catch { /* ignore */ }
+});
 
 window.notizli.onPaired(() => { void refresh(); void listDevices(); });
 void refresh();
