@@ -70,6 +70,15 @@ let channelLayout = "mono";
 let lastMeetingId = null;
 let nameEdited = false;
 let remoteHeard = false;
+let platform = "";              // from the main process: "win32", "darwin", …
+let defaultOutput = null;       // label of the default speaker when meeting audio was captured
+let reconnectTimer = null;
+let reconnecting = false;
+let quietWhileTalkingMs = 0;    // see the meter loop
+let lastTick = 0;
+let meetingWarning = false;
+let statusResetTimer = null;
+const isWindows = () => platform === "win32";
 
 function pad(n) { return String(n).padStart(2, "0"); }
 function fmtClock(ms) {
@@ -138,7 +147,15 @@ async function captureSystemAudio() {
  */
 function buildStereoMix(ctx, mic, sys) {
   const micMono = toMono(ctx, ctx.createMediaStreamSource(mic));
-  const sysMono = toMono(ctx, ctx.createMediaStreamSource(sys));
+  // The meeting side goes through a fixed mono node so its source can be
+  // swapped mid-recording (see reconnectMeetingAudio) without touching the
+  // merger, the recorder or the channel order.
+  const sysMono = ctx.createGain();
+  sysMono.channelCount = 1;
+  sysMono.channelCountMode = "explicit";
+  sysMono.channelInterpretation = "speakers";
+  let sysSource = ctx.createMediaStreamSource(sys);
+  sysSource.connect(sysMono);
 
   const micAnalyser = ctx.createAnalyser(); micAnalyser.fftSize = 256;
   const sysAnalyser = ctx.createAnalyser(); sysAnalyser.fftSize = 256;
@@ -166,6 +183,12 @@ function buildStereoMix(ctx, mic, sys) {
   return {
     stream: dest.stream,
     levels: () => ({ mic: rms(micAnalyser, micBuf), remote: rms(sysAnalyser, sysBuf) }),
+    replaceSystem: (stream) => {
+      const next = ctx.createMediaStreamSource(stream);
+      next.connect(sysMono);
+      sysSource.disconnect();
+      sysSource = next;
+    },
   };
 }
 
@@ -194,11 +217,47 @@ function pickMimeType() {
 }
 
 // ---- meter loop -------------------------------------------------------
+// How long the meeting side may stay silent while the microphone hears speech
+// before the recording screen says so. A lone notification blip must not count
+// as "the meeting is audible": it used to silence the only hint for a whole
+// 80-minute call whose meeting side was dead after minute 4.
+const QUIET_WARN_MS = 120_000;
+const QUIET_CLEAR_MS = 60_000;
+
+function updateMeetingWarning(mic, remote, dt) {
+  if (channelLayout !== "mic_remote") return;
+  if (remote >= 0.02) quietWhileTalkingMs = Math.max(0, quietWhileTalkingMs - dt * 4);
+  else if (mic >= 0.05 && remote < 0.01) quietWhileTalkingMs += dt;
+  if (!meetingWarning && quietWhileTalkingMs > QUIET_WARN_MS) {
+    meetingWarning = true;
+    recStatus.innerHTML = `<span class="warn-text">${meetingWarningText()}</span>`;
+  } else if (meetingWarning && quietWhileTalkingMs < QUIET_CLEAR_MS) {
+    meetingWarning = false;
+    setBothSidesStatus();
+  }
+}
+
+function meetingWarningText() {
+  return isWindows()
+    ? "Notizli can't hear the meeting — only your microphone. Make sure the call plays through your Windows default speaker (Teams: Settings → Devices → Speaker: Default)."
+    : "Notizli can't hear the meeting — only your microphone. Make sure the call plays through your Mac's current sound output.";
+}
+
+function setBothSidesStatus() {
+  recStatus.textContent = "Both sides captured on separate channels. Uploads when you finish.";
+  recStatus.className = "ok-text";
+}
+
 function startMeters() {
+  lastTick = performance.now();
   const tick = () => {
     const { mic, remote } = mix.levels();
+    const now = performance.now();
+    const dt = Math.min(1000, now - lastTick);
+    lastTick = now;
     micFill.style.width = `${Math.round(mic * 100)}%`;
     remFill.style.width = `${Math.round(remote * 100)}%`;
+    updateMeetingWarning(mic, remote, dt);
     const elapsed = (Date.now() - timerStart) / 1000;
     if (remote >= 0.01) remoteHeard = true;
     // Only while meeting audio has never produced a sound. A pause later in
@@ -208,6 +267,72 @@ function startMeters() {
     meterRaf = requestAnimationFrame(tick);
   };
   meterRaf = requestAnimationFrame(tick);
+}
+
+// ---- following the default speaker -------------------------------------
+//
+// Meeting audio is captured from the output device that was the default when
+// recording started, and Chromium does not follow a later switch. Unplugging a
+// headset mid-call therefore left the meeting side silent until the end (while
+// the default microphone did follow). On any device change we compare the
+// default speaker and, if it moved, capture it again and swap it in; the
+// recording itself keeps running, with a gap of about a second on that side.
+
+async function currentDefaultOutput() {
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    const d = devices.find((x) => x.kind === "audiooutput" && x.deviceId === "default");
+    return d ? d.label : null;
+  } catch {
+    return null;
+  }
+}
+
+function onDeviceChange() {
+  void listDevices();
+  // Proven on Windows (WASAPI loopback). macOS captures through ScreenCaptureKit,
+  // which is not tied to an output device, so it is left alone there.
+  if (!isWindows() || !mix || !mix.replaceSystem) return;
+  clearTimeout(reconnectTimer);
+  // Windows fires several events while a device comes and goes; the new
+  // default is only settled once they stop.
+  reconnectTimer = setTimeout(async () => {
+    if (!mix || !mix.replaceSystem) return;
+    const label = await currentDefaultOutput();
+    if (label !== null && label === defaultOutput) return;
+    const ok = await window.notizli.reconnectMeetingAudio();
+    if (ok && mix) flashStatus("Speaker changed — meeting audio reconnected.");
+  }, 1500);
+}
+
+// Run by the main process with a user gesture (getDisplayMedia requires one).
+window.__notizliReconnectMeetingAudio = async () => {
+  if (!mix || !mix.replaceSystem || reconnecting) return false;
+  reconnecting = true;
+  try {
+    const next = await captureSystemAudio();
+    if (!next) return false;
+    if (!mix || !mix.replaceSystem) {
+      next.getTracks().forEach((t) => t.stop());
+      return false;
+    }
+    const prev = systemStream;
+    mix.replaceSystem(next);
+    systemStream = next;
+    if (prev) prev.getTracks().forEach((t) => t.stop());
+    defaultOutput = await currentDefaultOutput();
+    return true;
+  } finally {
+    reconnecting = false;
+  }
+};
+
+function flashStatus(text) {
+  if (meetingWarning) return;
+  recStatus.textContent = text;
+  recStatus.className = "ok-text";
+  clearTimeout(statusResetTimer);
+  statusResetTimer = setTimeout(() => { if (!meetingWarning && mix) setBothSidesStatus(); }, 6000);
 }
 
 // ---- record flow -----------------------------------------------------
@@ -229,23 +354,32 @@ async function startRecording() {
   try {
     micStream = await navigator.mediaDevices.getUserMedia({ audio: micConstraints });
   } catch {
-    return fail("Microphone unavailable", "Notizli couldn't open the microphone. Check macOS → Privacy & Security → Microphone, then try again.");
+    return fail(
+      "Microphone unavailable",
+      isWindows()
+        ? "Notizli couldn't open the microphone. Check Windows Settings → Privacy & security → Microphone (and \"Let desktop apps access your microphone\"), then try again."
+        : "Notizli couldn't open the microphone. Check macOS → Privacy & Security → Microphone, then try again.",
+    );
   }
   void listDevices();
 
   systemStream = await captureSystemAudio();
+  defaultOutput = await currentDefaultOutput();
+  quietWhileTalkingMs = 0;
+  meetingWarning = false;
 
   audioCtx = new AudioContext();
   if (systemStream) {
     channelLayout = "mic_remote";
     mix = buildStereoMix(audioCtx, micStream, systemStream);
-    recStatus.textContent = "Both sides captured on separate channels. Uploads when you finish.";
-    recStatus.className = "ok-text";
+    setBothSidesStatus();
     recLabel.textContent = "Recording — both sides";
   } else {
     channelLayout = "mono";
     mix = buildMonoMic(audioCtx, micStream);
-    recStatus.innerHTML = '<span class="warn-text">Meeting audio unavailable — recording your microphone only. Grant Screen&nbsp;Recording and relaunch to capture the other side.</span>';
+    recStatus.innerHTML = isWindows()
+      ? '<span class="warn-text">Meeting audio unavailable — recording your microphone only.</span>'
+      : '<span class="warn-text">Meeting audio unavailable — recording your microphone only. Grant Screen&nbsp;Recording and relaunch to capture the other side.</span>';
     recLabel.textContent = "Recording — mic only";
   }
 
@@ -278,6 +412,8 @@ async function startRecording() {
 function teardownAudio() {
   cancelAnimationFrame(meterRaf);
   clearInterval(timerHandle);
+  clearTimeout(reconnectTimer);
+  clearTimeout(statusResetTimer);
   [micStream, systemStream].forEach((s) => s && s.getTracks().forEach((t) => t.stop()));
   micStream = systemStream = null;
   if (audioCtx) { audioCtx.close().catch(() => {}); audioCtx = null; }
@@ -522,6 +658,10 @@ unsentShowBtn.addEventListener("click", () => void window.notizli.showUnsent());
 async function refresh({ force = false } = {}) {
   const s = await window.notizli.getStatus();
   versionEl.textContent = "v" + s.version;
+  if (s.platform && s.platform !== platform) {
+    platform = s.platform;
+    applyPlatformCopy();
+  }
   paired = Boolean(s.paired);
   if (!paired) { show("unpaired"); return; }
   pairedLabel.textContent = s.label ? `Paired — ${s.label}` : "Paired";
@@ -530,8 +670,18 @@ async function refresh({ force = false } = {}) {
   if (!sections.idle.hidden) void renderUnsent();
 }
 
+// The static copy is written for macOS; Windows has no Screen Recording grant
+// and hears the meeting through the default speaker instead.
+function applyPlatformCopy() {
+  if (!isWindows()) return;
+  $("perm-note").textContent =
+    "Notizli records your microphone and whatever plays through your Windows default speaker — that is how it hears the other side. Keep the call on the default speaker (Teams: Speaker → Default).";
+  $("starting-title").textContent = "Starting…";
+  $("starting-note").textContent = "Opening your microphone and the meeting audio.";
+}
+
 window.notizli.onPaired(() => { void refresh(); void listDevices(); });
 void refresh();
 void listDevices();
-navigator.mediaDevices.addEventListener("devicechange", listDevices);
+navigator.mediaDevices.addEventListener("devicechange", onDeviceChange);
 setInterval(() => void refresh(), 3000);

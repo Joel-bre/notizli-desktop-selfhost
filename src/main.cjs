@@ -402,8 +402,21 @@ ipcMain.handle("get-status", () => {
     label: cfg.label || null,
     pairedAt: cfg.paired_at || null,
     version: app.getVersion(),
+    platform: process.platform,
   };
 });
+
+// The loopback source is bound to whichever output device was the default when
+// it was captured, and does not follow a later switch (headset unplugged,
+// Bluetooth dropped, dock or screen disconnected): the meeting side then goes
+// silent for the rest of the call. The renderer re-captures on a device change,
+// but getDisplayMedia needs a user gesture it doesn't have at that moment, so
+// it asks us to run the reconnect as one.
+ipcMain.handle("reconnect-meeting-audio", (e) =>
+  e.sender
+    .executeJavaScript("window.__notizliReconnectMeetingAudio ? window.__notizliReconnectMeetingAudio() : false", true)
+    .catch(() => false),
+);
 
 ipcMain.handle("open-dashboard", () => shell.openExternal(`${NOTIZLI_BASE_URL}/pair`));
 ipcMain.handle("open-meeting", (_e, meetingId) => {

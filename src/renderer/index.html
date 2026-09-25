@@ -273,7 +273,7 @@
     </button>
     <button class="block" id="unpair-btn" style="margin-top:10px">Unpair</button>
 
-    <p class="fineprint">
+    <p class="fineprint" id="perm-note">
       The first time you record, macOS asks for <span style="color:var(--ink)">Microphone</span> and
       <span style="color:var(--ink)">Screen&nbsp;Recording</span> — Screen Recording is how Notizli hears the other side.
     </p>
@@ -281,8 +281,8 @@
 
   <!-- ============ REQUESTING (permission prompts) ============ -->
   <section class="frame" id="s-starting" hidden>
-    <div class="status-line">Waiting for macOS permission…</div>
-    <p class="muted" style="margin-top:14px">
+    <div class="status-line" id="starting-title">Waiting for macOS permission…</div>
+    <p class="muted" id="starting-note" style="margin-top:14px">
       Allow <span style="color:var(--ink)">Microphone</span> and
       <span style="color:var(--ink)">Screen&nbsp;Recording</span> in the prompts.
       If you granted them earlier, this is instant.

@@ -16,6 +16,8 @@ contextBridge.exposeInMainWorld("notizli", {
   saveCopy: (id) => ipcRenderer.invoke("save-copy", id),
   confirmDiscard: () => ipcRenderer.invoke("confirm-discard"),
   setRecordingActive: (active) => ipcRenderer.send("recording-active", Boolean(active)),
+  // Re-captures meeting audio from the current default output; resolves true on success.
+  reconnectMeetingAudio: () => ipcRenderer.invoke("reconnect-meeting-audio"),
   onPaired: (cb) => {
     const handler = (_e, payload) => cb(payload);
     ipcRenderer.on("paired", handler);
