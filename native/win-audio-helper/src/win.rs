@@ -64,10 +64,16 @@ struct Options {
     exclude_pid: u32,
     poll: Duration,
     level_test: bool,
+    diagnose_secs: Option<u64>,
 }
 
 fn parse_args(args: Vec<String>) -> Options {
-    let mut o = Options { exclude_pid: std::process::id(), poll: Duration::from_millis(2000), level_test: false };
+    let mut o = Options {
+        exclude_pid: std::process::id(),
+        poll: Duration::from_millis(2000),
+        level_test: false,
+        diagnose_secs: None,
+    };
     let mut it = args.into_iter();
     while let Some(a) = it.next() {
         match a.as_str() {
@@ -82,6 +88,7 @@ fn parse_args(args: Vec<String>) -> Options {
                 }
             }
             "--level-test" => o.level_test = true,
+            "--diagnose" => o.diagnose_secs = Some(30),
             _ => {}
         }
     }
@@ -99,6 +106,9 @@ pub fn run(args: Vec<String>) -> i32 {
     if initialize_mta().is_err() {
         event(json!({ "event": "error", "message": "COM initialization failed" }));
         return 1;
+    }
+    if let Some(secs) = opts.diagnose_secs {
+        return diagnose(secs);
     }
 
     // The parent closing our stdin means Notizli quit or stopped recording.
@@ -227,11 +237,17 @@ fn choose_target(system: &mut System, exclude_pid: u32) -> Target {
 
 /// (pid, current peak) for every active playback session on every device.
 fn active_render_sessions() -> Vec<(u32, f32)> {
+    active_render_sessions_on_devices().into_iter().map(|(_, pid, peak)| (pid, peak)).collect()
+}
+
+/// (device name, pid, current peak) for every active playback session.
+fn active_render_sessions_on_devices() -> Vec<(String, u32, f32)> {
     let mut out = Vec::new();
     let Ok(enumerator) = DeviceEnumerator::new() else { return out };
     let Ok(devices) = enumerator.get_device_collection(&Direction::Render) else { return out };
     for device in &devices {
         let Ok(device) = device else { continue };
+        let device_name = device.get_friendlyname().unwrap_or_else(|_| "?".into());
         let Ok(manager) = device.get_iaudiosessionmanager() else { continue };
         let Ok(sessions) = manager.get_audiosessionenumerator() else { continue };
         let Ok(count) = sessions.get_count() else { continue };
@@ -245,7 +261,7 @@ fn active_render_sessions() -> Vec<(u32, f32)> {
                 .get_audiometerinformation()
                 .and_then(|m| m.get_peak_value())
                 .unwrap_or(0.0);
-            out.push((pid, peak));
+            out.push((device_name.clone(), pid, peak));
         }
     }
     out
@@ -420,4 +436,95 @@ fn capture_loop(
     }
     let _ = client.stop_stream();
     Ok(())
+}
+
+// ---- diagnose --------------------------------------------------------------
+
+fn chain(system: &System, pid: u32) -> String {
+    let mut parts = Vec::new();
+    let mut cur = Some(pid);
+    for _ in 0..12 {
+        let Some(p) = cur else { break };
+        parts.push(format!("{}({})", exe_name(system, p).unwrap_or_else(|| "?".into()), p));
+        cur = parent_of(system, p);
+    }
+    parts.join(" <- ")
+}
+
+/// Human-readable report for a call in progress: which processes play sound on
+/// which device, and what process loopback actually gets from each of them.
+fn diagnose(secs: u64) -> i32 {
+    let mut system = System::new();
+    system.refresh_processes(ProcessesToUpdate::All, true);
+    let own = std::process::id();
+    println!("Notizli audio diagnose, {secs} s. Keep the call going and let the other person talk.");
+    println!("Windows: {}", System::long_os_version().unwrap_or_default());
+    println!("Chosen by the recorder right now: {}", choose_target(&mut system, own).describe());
+    println!();
+
+    let sessions = active_render_sessions_on_devices();
+    println!("Active playback sessions ({}):", sessions.len());
+    let mut candidates: Vec<(u32, String)> = Vec::new();
+    for (device, pid, peak) in &sessions {
+        println!("  device \"{device}\"  peak {peak:.3}  process {}", chain(&system, *pid));
+        if *pid != 0 && !candidates.iter().any(|(p, _)| p == pid) {
+            candidates.push((*pid, format!("{}({pid})", exe_name(&system, *pid).unwrap_or_else(|| "?".into()))));
+        }
+        if let Some((_, root, name)) = classify(&system, *pid) {
+            if !candidates.iter().any(|(p, _)| *p == root) {
+                candidates.push((root, format!("{name} root({root})")));
+            }
+        }
+    }
+    println!();
+
+    let never = Arc::new(AtomicBool::new(false));
+    let mut captures: Vec<(String, Arc<Mutex<Level>>, Option<Capture>)> = Vec::new();
+    let mut targets: Vec<(String, Target)> = candidates
+        .into_iter()
+        .map(|(pid, label)| (label.clone(), Target::App { pid, name: label }))
+        .collect();
+    targets.push(("ALL except this helper".into(), Target::AllExcept { pid: own }));
+    for (label, target) in targets {
+        let level = Arc::new(Mutex::new(Level::default()));
+        let cap = match Capture::start(target, true, level.clone(), never.clone()) {
+            Ok(c) => Some(c),
+            Err(e) => {
+                println!("  capture of {label} failed: {e}");
+                None
+            }
+        };
+        captures.push((label, level, cap));
+    }
+
+    println!("Captured level per source, every 2 s (dB; -120 = nothing):");
+    let rounds = (secs / 2).max(1);
+    for round in 0..rounds {
+        thread::sleep(Duration::from_secs(2));
+        let mut line = format!("  t={:>3}s ", (round + 1) * 2);
+        for (label, level, cap) in &captures {
+            if cap.is_none() {
+                continue;
+            }
+            let l = std::mem::take(&mut *level.lock().unwrap());
+            let db = if l.n == 0 { -120.0 } else { 10.0 * ((l.sum_sq / l.n as f64).max(1e-12)).log10() };
+            line.push_str(&format!(" | {label}: {db:.1}"));
+        }
+        println!("{line}");
+        let peaks: Vec<String> = active_render_sessions_on_devices()
+            .into_iter()
+            .filter(|(_, _, pk)| *pk > 0.001)
+            .map(|(d, p, pk)| format!("{}({p})@\"{d}\" {pk:.3}", exe_name(&system, p).unwrap_or_else(|| "?".into())))
+            .collect();
+        println!("         sessions making sound: {}", if peaks.is_empty() { "none".into() } else { peaks.join(", ") });
+    }
+
+    for (_, _, cap) in captures {
+        if let Some(c) = cap {
+            c.stop();
+        }
+    }
+    println!();
+    println!("Done. Send this file to the Notizli team.");
+    0
 }

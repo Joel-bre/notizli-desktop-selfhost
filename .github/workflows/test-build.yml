@@ -40,5 +40,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: notizli-audio-helper-${{ github.run_number }}
-          path: native/win-audio-helper/target/release/notizli-audio-helper.exe
+          path: |
+            native/win-audio-helper/target/release/notizli-audio-helper.exe
+            native/win-audio-helper/diagnose-audio.bat
           retention-days: 14
