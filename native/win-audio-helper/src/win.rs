@@ -672,7 +672,8 @@ fn diagnose(secs: u64) -> i32 {
                 continue;
             }
             let l = std::mem::take(&mut *level.lock().unwrap());
-            println!("          {label:<60} {}", describe_level(&l));
+            let stopped = if capture.as_ref().is_ok_and(|c| c.finished()) { "  [capture stopped, see error above]" } else { "" };
+            println!("          {label:<60} {}{stopped}", describe_level(&l));
             tally.packets += l.packets;
             tally.silent_packets += l.silent_packets;
             if l.n > 0 && l.packets > l.silent_packets {
@@ -695,6 +696,7 @@ fn diagnose(secs: u64) -> i32 {
     for Probe { label, capture, tally, .. } in &probes {
         let verdict = match capture {
             Err(e) => format!("FAILED TO START ({e})"),
+            Ok(c) if tally.heard == 0 && c.finished() => "STOPPED WITH AN ERROR (see the error line above)".into(),
             Ok(_) if tally.heard > 0 => format!(
                 "HEARD in {} of {playing_rounds} checks, loudest {:.1} dB",
                 tally.heard,
