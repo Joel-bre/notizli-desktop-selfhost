@@ -1,0 +1,49 @@
+name: Test build (no release)
+
+# Builds an installer from a fix/ or test/ branch WITHOUT publishing a GitHub
+# Release, so installed recorders do not auto-update to it. Download the
+# installer from the run's Artifacts. The version is stamped as a prerelease
+# of the next patch, so the real release replaces it through auto-update.
+on:
+  push:
+    branches: ["fix/**", "test/**"]
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+      - run: npm ci
+      - name: Stamp a test version
+        shell: bash
+        run: |
+          base=$(node -p "require('./package.json').version")
+          IFS=. read -r maj min pat <<< "$base"
+          npm version --no-git-tag-version "$maj.$min.$((pat + 1))-test.${GITHUB_RUN_NUMBER}"
+      - name: Build the meeting-audio helper (Rust)
+        run: cargo build --release --manifest-path native/win-audio-helper/Cargo.toml
+      - name: Build Windows installer (not published)
+        run: npx electron-builder --win --publish never
+      - uses: actions/upload-artifact@v4
+        with:
+          name: notizli-windows-test-${{ github.run_number }}
+          path: dist/*.exe
+          retention-days: 14
+      - name: Stage the helper next to its batch file
+        shell: bash
+        run: |
+          mkdir -p helper-out
+          cp native/win-audio-helper/target/release/notizli-audio-helper.exe native/win-audio-helper/diagnose-audio.bat helper-out/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: notizli-audio-helper-${{ github.run_number }}
+          path: helper-out/
+          retention-days: 14

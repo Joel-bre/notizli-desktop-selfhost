@@ -48,6 +48,8 @@ jobs:
           node-version: 20
           cache: npm
       - run: npm ci
+      - name: Build the meeting-audio helper (Rust)
+        run: cargo build --release --manifest-path native/win-audio-helper/Cargo.toml
       - name: Build & publish Windows installer
         run: npx electron-builder --win --publish always
         env:

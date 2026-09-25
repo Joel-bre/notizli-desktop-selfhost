@@ -1,0 +1,32 @@
+name: Audio diagnose build (no release)
+
+# Builds only the Windows meeting-audio helper and its double-click
+# diagnose-audio.bat, as a workflow artifact. Never publishes a release.
+on:
+  push:
+    branches: ["claude/**"]
+    paths:
+      - "native/win-audio-helper/**"
+      - ".github/workflows/diagnose-build.yml"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+jobs:
+  helper:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build the meeting-audio helper (Rust)
+        run: cargo build --release --manifest-path native/win-audio-helper/Cargo.toml
+      - name: Stage the helper next to its batch file
+        shell: bash
+        run: |
+          mkdir -p helper-out
+          cp native/win-audio-helper/target/release/notizli-audio-helper.exe native/win-audio-helper/diagnose-audio.bat helper-out/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: notizli-audio-diagnose-${{ github.run_number }}
+          path: helper-out/
+          retention-days: 30

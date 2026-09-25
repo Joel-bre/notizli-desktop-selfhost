@@ -267,13 +267,19 @@
     <label class="field" for="device">Microphone</label>
     <select id="device"><option value="">Default microphone</option></select>
 
+    <label class="field" for="listening">You hear the call on</label>
+    <select id="listening">
+      <option value="speakers">Speakers (laptop or monitor)</option>
+      <option value="headphones">Headphones or earbuds</option>
+    </select>
+
     <button class="primary block" id="record-btn">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="2"/><path d="M4.93 19.07A10 10 0 0 1 4.93 4.93M7.76 16.24a6 6 0 0 1 0-8.49M16.24 7.76a6 6 0 0 1 0 8.49M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>
       Start recording
     </button>
     <button class="block" id="unpair-btn" style="margin-top:10px">Unpair</button>
 
-    <p class="fineprint">
+    <p class="fineprint" id="perm-note">
       The first time you record, macOS asks for <span style="color:var(--ink)">Microphone</span> and
       <span style="color:var(--ink)">Screen&nbsp;Recording</span> — Screen Recording is how Notizli hears the other side.
     </p>
@@ -281,8 +287,8 @@
 
   <!-- ============ REQUESTING (permission prompts) ============ -->
   <section class="frame" id="s-starting" hidden>
-    <div class="status-line">Waiting for macOS permission…</div>
-    <p class="muted" style="margin-top:14px">
+    <div class="status-line" id="starting-title">Waiting for macOS permission…</div>
+    <p class="muted" id="starting-note" style="margin-top:14px">
       Allow <span style="color:var(--ink)">Microphone</span> and
       <span style="color:var(--ink)">Screen&nbsp;Recording</span> in the prompts.
       If you granted them earlier, this is instant.
