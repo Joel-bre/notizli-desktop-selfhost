@@ -391,7 +391,6 @@ fn capture_loop(
 
     let mut raw: VecDeque<u8> = VecDeque::new();
     let mut mono_bytes: Vec<u8> = Vec::with_capacity(48_000);
-    let mut stdout = std::io::stdout().lock();
 
     while !stop.load(Ordering::SeqCst) {
         // A silent target may deliver no packets at all; the timeout only
@@ -427,7 +426,12 @@ fn capture_loop(
                 let mut lv = level.lock().unwrap();
                 lv.sum_sq += sum_sq;
                 lv.n += n;
-            } else if stdout.write_all(&mono_bytes).and_then(|_| stdout.flush()).is_err() {
+            } else if {
+                // Lock per write, never for the whole loop: diagnose prints to
+                // stdout from the main thread and would deadlock on a held lock.
+                let mut out = std::io::stdout().lock();
+                out.write_all(&mono_bytes).and_then(|_| out.flush()).is_err()
+            } {
                 // Parent stopped reading: we're done.
                 quit.store(true, Ordering::SeqCst);
                 break;
