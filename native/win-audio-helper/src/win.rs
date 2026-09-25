@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 use serde_json::json;
 use sysinfo::{Pid, ProcessesToUpdate, System};
 use wasapi::{
-    initialize_mta, AudioClient, DeviceEnumerator, Direction, SampleType, SessionState, StreamMode,
-    WaveFormat,
+    initialize_mta, AudioClient, AudioMeterInformation, DeviceEnumerator, Direction, Role, SampleType,
+    SessionState, StreamMode, WaveFormat,
 };
 
 const SAMPLE_RATE: usize = 48_000;
@@ -49,6 +49,8 @@ enum Target {
     App { pid: u32, name: String },
     /// Capture everything except this process tree (Notizli itself).
     AllExcept { pid: u32 },
+    /// Capture everything one speaker plays, from any app (endpoint loopback).
+    Device { id: String, name: String },
 }
 
 impl Target {
@@ -56,6 +58,7 @@ impl Target {
         match self {
             Target::App { pid, name } => json!({ "event": "target", "mode": "app", "name": name, "pid": pid }),
             Target::AllExcept { .. } => json!({ "event": "target", "mode": "all", "name": "All computer sound" }),
+            Target::Device { name, .. } => json!({ "event": "target", "mode": "device", "name": name }),
         }
     }
 }
@@ -184,9 +187,8 @@ pub fn run(args: Vec<String>) -> i32 {
         if opts.level_test && last_level.elapsed() >= Duration::from_secs(1) {
             last_level = Instant::now();
             let l = std::mem::take(&mut *level.lock().unwrap());
-            let db = if l.n == 0 { -120.0 } else { 10.0 * ((l.sum_sq / l.n as f64).max(1e-12)).log10() };
             let name = current.as_ref().map(|(t, _)| t.describe()["name"].clone()).unwrap_or_default();
-            event(json!({ "event": "level", "target": name, "rms_db": (db * 10.0).round() / 10.0 }));
+            event(json!({ "event": "level", "target": name, "rms_db": (l.rms_db() * 10.0).round() / 10.0 }));
         }
 
         sleep_unless_quit(&quit, opts.poll);
@@ -317,6 +319,19 @@ fn classify(system: &System, pid: u32) -> Option<(u8, u32, String)> {
 struct Level {
     sum_sq: f64,
     n: u64,
+    /// Packets Windows delivered, and how many of them it flagged as silent.
+    packets: u64,
+    silent_packets: u64,
+}
+
+impl Level {
+    fn rms_db(&self) -> f64 {
+        if self.n == 0 {
+            -120.0
+        } else {
+            10.0 * (self.sum_sq / self.n as f64).max(1e-12).log10()
+        }
+    }
 }
 
 struct Capture {
@@ -372,19 +387,33 @@ fn capture_loop(
     quit: &AtomicBool,
 ) -> Result<(), String> {
     initialize_mta().ok().map_err(|e| format!("COM: {e}"))?;
-    let (pid, include_tree) = match target {
-        Target::App { pid, .. } => (*pid, true),
-        Target::AllExcept { pid } => (*pid, false),
-    };
-    // Process loopback has no mix format of its own: ask for ours and let the
-    // engine convert.
+    // Ask for our format and let the engine convert: process loopback has no
+    // mix format of its own, and a speaker's own format varies by device.
     let format = WaveFormat::new(32, 32, &SampleType::Float, SAMPLE_RATE, CHANNELS, None);
     let block_align = format.get_blockalign() as usize;
-    let mut client = AudioClient::new_application_loopback_client(pid, include_tree).map_err(|e| e.to_string())?;
-    client
-        .initialize_client(&format, &Direction::Capture, &StreamMode::EventsShared { autoconvert: true, buffer_duration_hns: 0 })
-        .map_err(|e| e.to_string())?;
-    let h_event = client.set_get_eventhandle().map_err(|e| e.to_string())?;
+    let (mut client, mode) = match target {
+        Target::App { pid, .. } => (
+            AudioClient::new_application_loopback_client(*pid, true).map_err(|e| e.to_string())?,
+            StreamMode::EventsShared { autoconvert: true, buffer_duration_hns: 0 },
+        ),
+        Target::AllExcept { pid } => (
+            AudioClient::new_application_loopback_client(*pid, false).map_err(|e| e.to_string())?,
+            StreamMode::EventsShared { autoconvert: true, buffer_duration_hns: 0 },
+        ),
+        // Polled: loopback events are not signalled on every Windows 10 build.
+        Target::Device { id, .. } => {
+            let device = DeviceEnumerator::new().and_then(|e| e.get_device(id)).map_err(|e| e.to_string())?;
+            (
+                device.get_iaudioclient().map_err(|e| e.to_string())?,
+                StreamMode::PollingShared { autoconvert: true, buffer_duration_hns: 2_000_000 },
+            )
+        }
+    };
+    client.initialize_client(&format, &Direction::Capture, &mode).map_err(|e| e.to_string())?;
+    let h_event = match mode {
+        StreamMode::EventsShared { .. } => Some(client.set_get_eventhandle().map_err(|e| e.to_string())?),
+        _ => None,
+    };
     let capture = client.get_audiocaptureclient().map_err(|e| e.to_string())?;
     client.start_stream().map_err(|e| e.to_string())?;
     let _ = ready.send(Ok(()));
@@ -395,11 +424,24 @@ fn capture_loop(
     while !stop.load(Ordering::SeqCst) {
         // A silent target may deliver no packets at all; the timeout only
         // keeps the stop flag responsive.
-        let _ = h_event.wait_for_event(200);
+        match &h_event {
+            Some(h) => {
+                let _ = h.wait_for_event(200);
+            }
+            None => thread::sleep(Duration::from_millis(20)),
+        }
+        let (mut packets, mut silent_packets) = (0u64, 0u64);
         loop {
             match capture.get_next_packet_size() {
                 Ok(Some(n)) if n > 0 => {
-                    capture.read_from_device_to_deque(&mut raw).map_err(|e| e.to_string())?;
+                    let before = raw.len();
+                    let info = capture.read_from_device_to_deque(&mut raw).map_err(|e| e.to_string())?;
+                    packets += 1;
+                    // A packet flagged silent must be read as zeros, whatever its bytes hold.
+                    if info.flags.silent {
+                        silent_packets += 1;
+                        raw.iter_mut().skip(before).for_each(|b| *b = 0);
+                    }
                 }
                 Ok(_) => break,
                 Err(e) => return Err(e.to_string()),
@@ -421,17 +463,17 @@ fn capture_loop(
             n += 1;
             mono_bytes.extend_from_slice(&m.to_le_bytes());
         }
-        if n > 0 {
-            if level_test {
-                let mut lv = level.lock().unwrap();
-                lv.sum_sq += sum_sq;
-                lv.n += n;
-            } else if {
-                // Lock per write, never for the whole loop: diagnose prints to
-                // stdout from the main thread and would deadlock on a held lock.
-                let mut out = std::io::stdout().lock();
-                out.write_all(&mono_bytes).and_then(|_| out.flush()).is_err()
-            } {
+        if level_test {
+            let mut lv = level.lock().unwrap();
+            lv.sum_sq += sum_sq;
+            lv.n += n;
+            lv.packets += packets;
+            lv.silent_packets += silent_packets;
+        } else if n > 0 {
+            // Lock per write, never for the whole loop: diagnose prints to
+            // stdout from the main thread and would deadlock on a held lock.
+            let mut out = std::io::stdout().lock();
+            if out.write_all(&mono_bytes).and_then(|_| out.flush()).is_err() {
                 // Parent stopped reading: we're done.
                 quit.store(true, Ordering::SeqCst);
                 break;
@@ -489,14 +531,71 @@ fn meter_snapshot(system: &System) -> Vec<String> {
     lines
 }
 
+/// A speaker counts as playing when its peak passes this during a 2-s check.
+const PLAYING_PEAK: f32 = 0.02;
+/// A capture counts as hearing the call when its 2-s level passes this.
+const HEARD_DB: f64 = -70.0;
+
+fn default_speaker(role: Role) -> String {
+    DeviceEnumerator::new()
+        .and_then(|e| e.get_default_device_for_role(&Direction::Render, &role))
+        .and_then(|d| d.get_friendlyname())
+        .unwrap_or_else(|_| "none".into())
+}
+
+/// (id, name, meter) for every active speaker.
+fn speakers() -> Vec<(String, String, AudioMeterInformation)> {
+    let mut out = Vec::new();
+    let Ok(enumerator) = DeviceEnumerator::new() else { return out };
+    let Ok(devices) = enumerator.get_device_collection(&Direction::Render) else { return out };
+    for device in &devices {
+        let Ok(device) = device else { continue };
+        let (Ok(id), Ok(meter)) = (device.get_id(), device.get_audiometerinformation()) else { continue };
+        out.push((id, device.get_friendlyname().unwrap_or_else(|_| "?".into()), meter));
+    }
+    out
+}
+
+fn describe_level(l: &Level) -> String {
+    if l.packets == 0 {
+        "no data".into()
+    } else if l.silent_packets == l.packets {
+        "data, all marked silent by Windows".into()
+    } else if l.silent_packets > 0 {
+        format!("{:.1} dB ({} of {} packets marked silent)", l.rms_db(), l.silent_packets, l.packets)
+    } else {
+        format!("{:.1} dB", l.rms_db())
+    }
+}
+
+/// One capture running during the diagnose, and what it got across the checks.
+struct Probe {
+    label: String,
+    level: Arc<Mutex<Level>>,
+    capture: Result<Capture, String>,
+    tally: Tally,
+}
+
+#[derive(Default)]
+struct Tally {
+    heard: u32,
+    best_db: Option<f64>,
+    packets: u64,
+    silent_packets: u64,
+}
+
 /// Human-readable report for a call in progress: which processes play sound on
-/// which device, and what process loopback actually gets from each of them.
+/// which device, and what each way of capturing actually gets while they do.
 fn diagnose(secs: u64) -> i32 {
     let mut system = System::new();
     system.refresh_processes(ProcessesToUpdate::All, true);
     let own = std::process::id();
-    println!("Notizli audio diagnose v2. Keep the call going and let the other person talk.");
+    let default_console = default_speaker(Role::Console);
+    let default_calls = default_speaker(Role::Communications);
+    println!("Notizli audio diagnose v3. Keep the call going and let the other person talk.");
     println!("Windows: {}", System::long_os_version().unwrap_or_default());
+    println!("Windows default speaker: \"{default_console}\"");
+    println!("Windows default speaker for calls: \"{default_calls}\"");
     println!("Chosen by the recorder right now: {}", choose_target(&mut system, own).describe());
     println!();
 
@@ -511,67 +610,109 @@ fn diagnose(secs: u64) -> i32 {
 
     let sessions = active_render_sessions_on_devices();
     println!("Active playback sessions ({}):", sessions.len());
-    let mut candidates: Vec<(u32, String)> = Vec::new();
+    let mut targets: Vec<(String, Target)> = Vec::new();
+    let add_app = |targets: &mut Vec<(String, Target)>, pid: u32, label: String| {
+        if !targets.iter().any(|(_, t)| matches!(t, Target::App { pid: p, .. } if *p == pid)) {
+            targets.push((label.clone(), Target::App { pid, name: label }));
+        }
+    };
     for (device, pid, peak) in &sessions {
         println!("  device \"{device}\"  peak {peak:.3}  process {}", chain(&system, *pid));
-        if *pid != 0 && !candidates.iter().any(|(p, _)| p == pid) {
-            candidates.push((*pid, format!("{}({pid})", exe_name(&system, *pid).unwrap_or_else(|| "?".into()))));
+        if *pid != 0 {
+            let exe = exe_name(&system, *pid).unwrap_or_else(|| "?".into());
+            add_app(&mut targets, *pid, format!("App: {exe}({pid}) + children"));
         }
         if let Some((_, root, name)) = classify(&system, *pid) {
-            if !candidates.iter().any(|(p, _)| *p == root) {
-                candidates.push((root, format!("{name} root({root})")));
-            }
+            add_app(&mut targets, root, format!("App: {name}, top process({root}) + children"));
         }
     }
     println!();
+    targets.push(("Everything except this helper".into(), Target::AllExcept { pid: own }));
+    let speakers = speakers();
+    for (id, name, _) in &speakers {
+        targets.push((format!("Whole speaker: \"{name}\""), Target::Device { id: id.clone(), name: name.clone() }));
+    }
 
     println!("PART 2 - starting a capture of each source:");
     let never = Arc::new(AtomicBool::new(false));
-    let mut captures: Vec<(String, Arc<Mutex<Level>>, Option<Capture>)> = Vec::new();
-    let mut targets: Vec<(String, Target)> = candidates
-        .into_iter()
-        .map(|(pid, label)| (label.clone(), Target::App { pid, name: label }))
-        .collect();
-    targets.push(("ALL except this helper".into(), Target::AllExcept { pid: own }));
+    let mut probes: Vec<Probe> = Vec::new();
     for (label, target) in targets {
         println!("  starting {label} ...");
         let level = Arc::new(Mutex::new(Level::default()));
-        let cap = match Capture::start(target, true, level.clone(), never.clone()) {
-            Ok(c) => {
-                println!("    ok");
-                Some(c)
-            }
-            Err(e) => {
-                println!("    FAILED: {e}");
-                None
-            }
-        };
-        captures.push((label, level, cap));
+        let capture = Capture::start(target, true, level.clone(), never.clone());
+        match &capture {
+            Ok(_) => println!("    ok"),
+            Err(e) => println!("    FAILED: {e}"),
+        }
+        probes.push(Probe { label, level, capture, tally: Tally::default() });
     }
     println!();
 
-    println!("PART 3 - level captured from each source, every 2 s (dB; -120 = nothing):");
+    println!("PART 3 - what each capture gets, every 2 s (dB; -120 = digital silence), next to each speaker's peak:");
     let rounds = (secs / 2).max(1);
+    let mut playing_rounds = 0;
     for round in 0..rounds {
-        thread::sleep(Duration::from_secs(2));
-        let mut line = format!("  t={:>3}s ", (round + 1) * 2);
-        for (label, level, cap) in &captures {
-            if cap.is_none() {
+        // Sample the speakers' meters through the window: one reading is only
+        // the peak of the last few milliseconds.
+        let mut peaks = vec![0f32; speakers.len()];
+        for _ in 0..20 {
+            thread::sleep(Duration::from_millis(100));
+            for (peak, (_, _, meter)) in peaks.iter_mut().zip(&speakers) {
+                *peak = peak.max(meter.get_peak_value().unwrap_or(0.0));
+            }
+        }
+        let playing = peaks.iter().any(|p| *p > PLAYING_PEAK);
+        if playing {
+            playing_rounds += 1;
+        }
+        let speaker_line: Vec<String> = speakers.iter().zip(&peaks).map(|((_, name, _), p)| format!("\"{name}\" {p:.2}")).collect();
+        println!("  t={:>3}s  speakers: {}", (round + 1) * 2, speaker_line.join(", "));
+        for Probe { label, level, capture, tally } in probes.iter_mut() {
+            if capture.is_err() {
                 continue;
             }
             let l = std::mem::take(&mut *level.lock().unwrap());
-            let db = if l.n == 0 { -120.0 } else { 10.0 * ((l.sum_sq / l.n as f64).max(1e-12)).log10() };
-            line.push_str(&format!(" | {label}: {db:.1}"));
+            println!("          {label:<60} {}", describe_level(&l));
+            tally.packets += l.packets;
+            tally.silent_packets += l.silent_packets;
+            if l.n > 0 && l.packets > l.silent_packets {
+                let db = l.rms_db();
+                tally.best_db = Some(tally.best_db.map_or(db, |b| b.max(db)));
+                if playing && db > HEARD_DB {
+                    tally.heard += 1;
+                }
+            }
         }
-        println!("{line}");
+    }
+    println!();
+
+    println!("RESULT");
+    println!("  Windows default speaker: \"{default_console}\"; for calls: \"{default_calls}\"");
+    println!("  A speaker was playing sound in {playing_rounds} of {rounds} checks.");
+    if playing_rounds == 0 {
+        println!("  !! No speaker played anything: the other person must talk during the test.");
+    }
+    for Probe { label, capture, tally, .. } in &probes {
+        let verdict = match capture {
+            Err(e) => format!("FAILED TO START ({e})"),
+            Ok(_) if tally.heard > 0 => format!(
+                "HEARD in {} of {playing_rounds} checks, loudest {:.1} dB",
+                tally.heard,
+                tally.best_db.unwrap_or(-120.0)
+            ),
+            Ok(_) if tally.packets == 0 => "NOTHING - Windows sent no data".into(),
+            Ok(_) if tally.silent_packets == tally.packets => "NOTHING - Windows sent only packets marked silent".into(),
+            Ok(_) => format!("NOTHING - data arrived but silent, loudest {:.1} dB", tally.best_db.unwrap_or(-120.0)),
+        };
+        println!("  {label:<60} {verdict}");
     }
 
-    for (_, _, cap) in captures {
-        if let Some(c) = cap {
+    for probe in probes {
+        if let Ok(c) = probe.capture {
             c.stop();
         }
     }
     println!();
-    println!("Done. Send this file to the Notizli team.");
+    println!("Done. Send this whole file to the Notizli team.");
     0
 }
