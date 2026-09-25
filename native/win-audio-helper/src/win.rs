@@ -451,15 +451,58 @@ fn chain(system: &System, pid: u32) -> String {
     parts.join(" <- ")
 }
 
+/// Every playback device with its output peak, and every session on it (any
+/// state) with its own peak. A device that is loud while none of its sessions
+/// are points at audio bypassing the shared mixer (hardware offload).
+fn meter_snapshot(system: &System) -> Vec<String> {
+    let mut lines = Vec::new();
+    let Ok(enumerator) = DeviceEnumerator::new() else { return lines };
+    let Ok(devices) = enumerator.get_device_collection(&Direction::Render) else { return lines };
+    for device in &devices {
+        let Ok(device) = device else { continue };
+        let name = device.get_friendlyname().unwrap_or_else(|_| "?".into());
+        let dev_peak = device.get_audiometerinformation().and_then(|m| m.get_peak_value()).unwrap_or(-1.0);
+        let mut parts = Vec::new();
+        if let Ok(manager) = device.get_iaudiosessionmanager() {
+            if let Ok(sessions) = manager.get_audiosessionenumerator() {
+                for i in 0..sessions.get_count().unwrap_or(0) {
+                    let Ok(c) = sessions.get_session(i) else { continue };
+                    let state = match c.get_state() {
+                        Ok(SessionState::Active) => "active",
+                        Ok(SessionState::Inactive) => "inactive",
+                        Ok(_) => "expired",
+                        Err(_) => "?",
+                    };
+                    let pid = c.get_process_id().unwrap_or(0);
+                    let pk = c.get_audiometerinformation().and_then(|m| m.get_peak_value()).unwrap_or(-1.0);
+                    let exe = if pid == 0 { "system-sounds".into() } else { exe_name(system, pid).unwrap_or_else(|| "?".into()) };
+                    parts.push(format!("{exe}({pid}) {state} {pk:.3}"));
+                }
+            }
+        }
+        lines.push(format!("\"{name}\" OUTPUT {dev_peak:.3} | sessions: {}", if parts.is_empty() { "none".into() } else { parts.join(", ") }));
+    }
+    lines
+}
+
 /// Human-readable report for a call in progress: which processes play sound on
 /// which device, and what process loopback actually gets from each of them.
 fn diagnose(secs: u64) -> i32 {
     let mut system = System::new();
     system.refresh_processes(ProcessesToUpdate::All, true);
     let own = std::process::id();
-    println!("Notizli audio diagnose, {secs} s. Keep the call going and let the other person talk.");
+    println!("Notizli audio diagnose v2. Keep the call going and let the other person talk.");
     println!("Windows: {}", System::long_os_version().unwrap_or_default());
     println!("Chosen by the recorder right now: {}", choose_target(&mut system, own).describe());
+    println!();
+
+    println!("PART 1 - output level of every speaker vs. level of each app on it, every second for 10 s:");
+    for t in 1..=10 {
+        for line in meter_snapshot(&system) {
+            println!("  t={t:>2}s {line}");
+        }
+        thread::sleep(Duration::from_secs(1));
+    }
     println!();
 
     let sessions = active_render_sessions_on_devices();
@@ -478,6 +521,7 @@ fn diagnose(secs: u64) -> i32 {
     }
     println!();
 
+    println!("PART 2 - starting a capture of each source:");
     let never = Arc::new(AtomicBool::new(false));
     let mut captures: Vec<(String, Arc<Mutex<Level>>, Option<Capture>)> = Vec::new();
     let mut targets: Vec<(String, Target)> = candidates
@@ -486,18 +530,23 @@ fn diagnose(secs: u64) -> i32 {
         .collect();
     targets.push(("ALL except this helper".into(), Target::AllExcept { pid: own }));
     for (label, target) in targets {
+        println!("  starting {label} ...");
         let level = Arc::new(Mutex::new(Level::default()));
         let cap = match Capture::start(target, true, level.clone(), never.clone()) {
-            Ok(c) => Some(c),
+            Ok(c) => {
+                println!("    ok");
+                Some(c)
+            }
             Err(e) => {
-                println!("  capture of {label} failed: {e}");
+                println!("    FAILED: {e}");
                 None
             }
         };
         captures.push((label, level, cap));
     }
+    println!();
 
-    println!("Captured level per source, every 2 s (dB; -120 = nothing):");
+    println!("PART 3 - level captured from each source, every 2 s (dB; -120 = nothing):");
     let rounds = (secs / 2).max(1);
     for round in 0..rounds {
         thread::sleep(Duration::from_secs(2));
@@ -511,12 +560,6 @@ fn diagnose(secs: u64) -> i32 {
             line.push_str(&format!(" | {label}: {db:.1}"));
         }
         println!("{line}");
-        let peaks: Vec<String> = active_render_sessions_on_devices()
-            .into_iter()
-            .filter(|(_, _, pk)| *pk > 0.001)
-            .map(|(d, p, pk)| format!("{}({p})@\"{d}\" {pk:.3}", exe_name(&system, p).unwrap_or_else(|| "?".into())))
-            .collect();
-        println!("         sessions making sound: {}", if peaks.is_empty() { "none".into() } else { peaks.join(", ") });
     }
 
     for (_, _, cap) in captures {

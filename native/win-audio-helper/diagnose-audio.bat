@@ -1,7 +1,7 @@
 @echo off
 cd /d "%~dp0"
 echo.
-echo  Notizli audio diagnose - 30 seconds.
+echo  Notizli audio diagnose - about 50 seconds. Leave this window open until Notepad appears.
 echo  Start this DURING a call, and let the other person talk the whole time.
 echo.
 set HELPER=notizli-audio-helper.exe
