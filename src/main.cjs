@@ -409,11 +409,12 @@ ipcMain.handle("get-status", () => {
 
 // --- Windows meeting-audio helper -------------------------------------------
 //
-// native/win-audio-helper: records the meeting app's own sound (Windows
-// process loopback) wherever it plays. Electron's "loopback" below can only
-// record the default speaker's mix, and on laptops that came back silent for
-// Teams on the built-in speakers. The helper streams mono f32 PCM at 48 kHz on
-// stdout and JSON events on stderr; closing its stdin stops it.
+// native/win-audio-helper: records the whole speaker the call app is playing
+// on (endpoint loopback), following it when it changes. Electron's "loopback"
+// below can only record the DEFAULT speaker's mix, which was silent whenever
+// Teams played elsewhere (e.g. default = external monitor). The helper streams
+// mono f32 PCM at 48 kHz on stdout and JSON events on stderr; closing its stdin
+// stops it; exit code 3 = nothing capturable (the renderer falls back).
 
 let audioHelper = null;
 

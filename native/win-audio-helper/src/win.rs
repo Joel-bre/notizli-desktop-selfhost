@@ -53,16 +53,6 @@ enum Target {
     Device { id: String, name: String },
 }
 
-impl Target {
-    fn describe(&self) -> serde_json::Value {
-        match self {
-            Target::App { pid, name } => json!({ "event": "target", "mode": "app", "name": name, "pid": pid }),
-            Target::AllExcept { .. } => json!({ "event": "target", "mode": "all", "name": "All computer sound" }),
-            Target::Device { name, .. } => json!({ "event": "target", "mode": "device", "name": name }),
-        }
-    }
-}
-
 struct Options {
     exclude_pid: u32,
     poll: Duration,
@@ -73,7 +63,7 @@ struct Options {
 fn parse_args(args: Vec<String>) -> Options {
     let mut o = Options {
         exclude_pid: std::process::id(),
-        poll: Duration::from_millis(2000),
+        poll: Duration::from_millis(1000),
         level_test: false,
         diagnose_secs: None,
     };
@@ -126,35 +116,39 @@ pub fn run(args: Vec<String>) -> i32 {
         });
     }
 
+    // Recording mode captures a whole speaker (endpoint loopback): on the
+    // affected laptop, per-app process loopback returned only zeros while the
+    // speaker's loopback heard the call clearly (FINDINGS.md). The call app is
+    // used only to pick WHICH speaker, and to label what is heard.
     let level = Arc::new(Mutex::new(Level::default()));
     let mut system = System::new();
-    let mut current: Option<(Target, Capture)> = None;
-    let mut pending: Option<(Target, u8)> = None;
+    let mut current: Option<(SpeakerChoice, Capture)> = None;
+    let mut pending: Option<(String, u8)> = None; // device id waiting to be confirmed
     let mut last_level = Instant::now();
     event(json!({ "event": "ready" }));
 
     while !quit.load(Ordering::SeqCst) {
-        let wanted = choose_target(&mut system, opts.exclude_pid);
+        let Some(wanted) = choose_speaker(&mut system, opts.exclude_pid) else {
+            sleep_unless_quit(&quit, opts.poll);
+            continue;
+        };
 
-        // Switch only when the choice is stable for two polls, so a one-off
-        // sound from another app does not bounce the capture back and forth.
+        // Restart only when the SPEAKER changes, and only once the new choice
+        // holds for two checks, so a one-off sound elsewhere can't bounce it.
         let switch = match &current {
             None => true,
-            Some((t, cap)) if cap.finished() => {
-                let _ = t;
-                true
-            }
-            Some((t, _)) if *t == wanted => {
+            Some((_, cap)) if cap.finished() => true,
+            Some((c, _)) if c.id == wanted.id => {
                 pending = None;
                 false
             }
             Some(_) => match &mut pending {
-                Some((t, n)) if *t == wanted => {
+                Some((id, n)) if *id == wanted.id => {
                     *n += 1;
                     *n >= 2
                 }
                 _ => {
-                    pending = Some((wanted.clone(), 1));
+                    pending = Some((wanted.id.clone(), 1));
                     false
                 }
             },
@@ -165,29 +159,44 @@ pub fn run(args: Vec<String>) -> i32 {
                 cap.stop();
             }
             pending = None;
-            match Capture::start(wanted.clone(), opts.level_test, level.clone(), quit.clone()) {
+            let target = Target::Device { id: wanted.id.clone(), name: wanted.name.clone() };
+            match Capture::start(target, opts.level_test, level.clone(), quit.clone()) {
                 Ok(cap) => {
-                    event(wanted.describe());
+                    wanted.announce();
                     current = Some((wanted, cap));
                 }
                 Err(e) => {
-                    event(json!({ "event": "error", "message": format!("capture failed: {e}") }));
-                    // Fall back to everything-but-us rather than nothing.
-                    let fallback = Target::AllExcept { pid: opts.exclude_pid };
-                    if wanted != fallback {
-                        if let Ok(cap) = Capture::start(fallback.clone(), opts.level_test, level.clone(), quit.clone()) {
-                            event(fallback.describe());
-                            current = Some((fallback, cap));
+                    event(json!({ "event": "error", "message": format!("capture of \"{}\" failed: {e}", wanted.name) }));
+                    // Try the Windows default speaker before giving up.
+                    match default_speaker_choice() {
+                        Some(def) if def.id != wanted.id => {
+                            let target = Target::Device { id: def.id.clone(), name: def.name.clone() };
+                            if let Ok(cap) = Capture::start(target, opts.level_test, level.clone(), quit.clone()) {
+                                def.announce();
+                                current = Some((def, cap));
+                            }
                         }
+                        _ => {}
+                    }
+                    if current.is_none() {
+                        // Nothing capturable: exit so the app falls back to its own loopback.
+                        event(json!({ "event": "error", "message": "no speaker could be captured" }));
+                        return 3;
                     }
                 }
+            }
+        } else if let Some((c, _)) = current.as_mut() {
+            // Same speaker, different app playing on it: relabel only.
+            if c.id == wanted.id && c.app != wanted.app {
+                c.app = wanted.app;
+                c.announce();
             }
         }
 
         if opts.level_test && last_level.elapsed() >= Duration::from_secs(1) {
             last_level = Instant::now();
             let l = std::mem::take(&mut *level.lock().unwrap());
-            let name = current.as_ref().map(|(t, _)| t.describe()["name"].clone()).unwrap_or_default();
+            let name = current.as_ref().map(|(c, _)| c.name.clone()).unwrap_or_default();
             event(json!({ "event": "level", "target": name, "rms_db": (l.rms_db() * 10.0).round() / 10.0 }));
         }
 
@@ -211,45 +220,65 @@ fn sleep_unless_quit(quit: &AtomicBool, total: Duration) {
 
 // ---- target selection ------------------------------------------------------
 
-/// Pick the process tree to capture from the audio sessions that are active
-/// right now, on any output device.
-fn choose_target(system: &mut System, exclude_pid: u32) -> Target {
-    system.refresh_processes(ProcessesToUpdate::All, true);
-    let mut best: Option<(u8, f32, u32, String)> = None; // (priority, peak, root pid, name)
+/// The speaker to record: the one on which the highest-priority app (call apps,
+/// then browsers) has its loudest active session; else the Windows default.
+#[derive(Clone, Debug)]
+struct SpeakerChoice {
+    id: String,
+    name: String,
+    /// Label of the app heard on it; empty when none is identified.
+    app: String,
+}
 
-    for (pid, peak) in active_render_sessions() {
+impl SpeakerChoice {
+    fn announce(&self) {
+        event(json!({ "event": "target", "mode": "device", "name": self.name, "app": self.app }));
+    }
+}
+
+fn choose_speaker(system: &mut System, exclude_pid: u32) -> Option<SpeakerChoice> {
+    system.refresh_processes(ProcessesToUpdate::All, true);
+    // (priority, peak, device id, device name, app name)
+    let mut best: Option<(u8, f32, String, String, String)> = None;
+    for (id, device, pid, peak) in active_render_sessions_on_devices() {
         if pid == 0 || in_tree(system, pid, exclude_pid) {
             continue;
         }
-        let Some((priority, root, name)) = classify(system, pid) else { continue };
+        let Some((priority, _root, app)) = classify(system, pid) else { continue };
         let better = match &best {
             None => true,
-            Some((p, pk, _, _)) => priority < *p || (priority == *p && peak > *pk),
+            Some((p, pk, ..)) => priority < *p || (priority == *p && peak > *pk),
         };
         if better {
-            best = Some((priority, peak, root, name));
+            best = Some((priority, peak, id, device, app));
         }
     }
-
     match best {
-        Some((_, _, pid, name)) => Target::App { pid, name },
-        None => Target::AllExcept { pid: exclude_pid },
+        Some((_, _, id, name, app)) => Some(SpeakerChoice { id, name, app }),
+        None => default_speaker_choice(),
     }
 }
 
-/// (pid, current peak) for every active playback session on every device.
-fn active_render_sessions() -> Vec<(u32, f32)> {
-    active_render_sessions_on_devices().into_iter().map(|(_, pid, peak)| (pid, peak)).collect()
+fn default_speaker_choice() -> Option<SpeakerChoice> {
+    let device = DeviceEnumerator::new()
+        .and_then(|e| e.get_default_device_for_role(&Direction::Render, &Role::Console))
+        .ok()?;
+    Some(SpeakerChoice {
+        id: device.get_id().ok()?,
+        name: device.get_friendlyname().unwrap_or_else(|_| "?".into()),
+        app: String::new(),
+    })
 }
 
-/// (device name, pid, current peak) for every active playback session.
-fn active_render_sessions_on_devices() -> Vec<(String, u32, f32)> {
+/// (device id, device name, pid, current peak) for every active playback session.
+fn active_render_sessions_on_devices() -> Vec<(String, String, u32, f32)> {
     let mut out = Vec::new();
     let Ok(enumerator) = DeviceEnumerator::new() else { return out };
     let Ok(devices) = enumerator.get_device_collection(&Direction::Render) else { return out };
     for device in &devices {
         let Ok(device) = device else { continue };
         let device_name = device.get_friendlyname().unwrap_or_else(|_| "?".into());
+        let device_id = device.get_id().unwrap_or_default();
         let Ok(manager) = device.get_iaudiosessionmanager() else { continue };
         let Ok(sessions) = manager.get_audiosessionenumerator() else { continue };
         let Ok(count) = sessions.get_count() else { continue };
@@ -263,7 +292,7 @@ fn active_render_sessions_on_devices() -> Vec<(String, u32, f32)> {
                 .get_audiometerinformation()
                 .and_then(|m| m.get_peak_value())
                 .unwrap_or(0.0);
-            out.push((device_name.clone(), pid, peak));
+            out.push((device_id.clone(), device_name.clone(), pid, peak));
         }
     }
     out
@@ -596,7 +625,10 @@ fn diagnose(secs: u64) -> i32 {
     println!("Windows: {}", System::long_os_version().unwrap_or_default());
     println!("Windows default speaker: \"{default_console}\"");
     println!("Windows default speaker for calls: \"{default_calls}\"");
-    println!("Chosen by the recorder right now: {}", choose_target(&mut system, own).describe());
+    match choose_speaker(&mut system, own) {
+        Some(c) => println!("Recorder would capture speaker \"{}\" (app: {})", c.name, if c.app.is_empty() { "none identified" } else { &c.app }),
+        None => println!("Recorder would capture: no speaker found"),
+    }
     println!();
 
     println!("PART 1 - output level of every speaker vs. level of each app on it, every second for 10 s:");
@@ -616,7 +648,7 @@ fn diagnose(secs: u64) -> i32 {
             targets.push((label.clone(), Target::App { pid, name: label }));
         }
     };
-    for (device, pid, peak) in &sessions {
+    for (_id, device, pid, peak) in &sessions {
         println!("  device \"{device}\"  peak {peak:.3}  process {}", chain(&system, *pid));
         if *pid != 0 {
             let exe = exe_name(&system, *pid).unwrap_or_else(|| "?".into());

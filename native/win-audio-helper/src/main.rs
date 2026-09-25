@@ -1,19 +1,25 @@
 //! Notizli meeting-audio helper (Windows only).
 //!
-//! Captures the far end of a call straight from the meeting app's process tree
-//! (Windows process loopback, 10 2004+), whichever speaker it plays on and
-//! before driver "call enhancement" processing. Electron's own `"loopback"`
-//! can only record the default speaker's mix, which on a laptop with Teams on
-//! its speakers came back as digital silence.
+//! Records the far end of a call by capturing the WHOLE SPEAKER (endpoint
+//! loopback) that the meeting app is playing on — not just the Windows default
+//! speaker, which is all Electron's own `"loopback"` can record. Per-app
+//! process loopback is used only by `--diagnose`: on the affected laptop it
+//! returned digital zeros while the speaker's loopback heard the call
+//! (see FINDINGS.md).
 //!
-//! Target choice, re-checked every `--poll-ms`:
-//!   1. a known meeting app with an active audio session (Teams, Zoom, Webex…)
-//!   2. otherwise a browser with an active session (Chrome, Edge…)
-//!   3. otherwise everything the computer plays except Notizli (`--exclude-pid`)
+//! Speaker choice, re-checked every `--poll-ms` (default 1 s), switched only
+//! when the new speaker holds for two checks:
+//!   1. the speaker where a known meeting app (Teams, Zoom, Webex…) has its
+//!      loudest active audio session
+//!   2. otherwise the speaker where a browser (Chrome, Edge…) is playing
+//!   3. otherwise the Windows default speaker
+//! The app found is only a label ("hearing Microsoft Teams"); the capture is
+//! everything that speaker plays.
 //!
 //! Protocol with the Electron main process:
 //!   stdout  raw PCM, f32 little-endian, mono, 48 000 Hz, continuous while captured
-//!   stderr  one JSON object per line: ready | target | level | error
+//!   stderr  one JSON object per line: ready | target {mode:"device",name,app} | level | error
+//!           (exit code 3 when no speaker can be captured: the app falls back)
 //!   stdin   closed by the parent → exit (so the helper never outlives the app)
 //!
 //! `--level-test` writes no PCM and prints the captured level once a second,

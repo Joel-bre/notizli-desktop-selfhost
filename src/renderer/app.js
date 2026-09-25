@@ -251,7 +251,7 @@ function meetingWarningText() {
 
 function setBothSidesStatus() {
   recStatus.textContent = hearing
-    ? `Both sides captured — hearing ${hearing}. Uploads when you finish.`
+    ? `Both sides captured — Hearing: ${hearing}. Uploads when you finish.`
     : "Both sides captured on separate channels. Uploads when you finish.";
   recStatus.className = "ok-text";
 }
@@ -336,12 +336,13 @@ window.__notizliReconnectMeetingAudio = async () => {
   }
 };
 
-// ---- Windows: the meeting app's own sound ------------------------------------
+// ---- Windows: the speaker the call plays on ------------------------------------
 //
-// native/win-audio-helper captures the call app's process tree (Teams, Zoom,
-// Webex, Slack, WhatsApp, then browsers, else everything but Notizli) whatever
-// speaker it plays on. It is tried first on Windows; if it can't start, or dies
-// mid-call, recording falls back to Electron's default-speaker loopback.
+// native/win-audio-helper records the whole speaker that the call app (Teams,
+// Zoom, Webex, Slack, WhatsApp, then browsers) is playing on, else the Windows
+// default speaker — Electron's own loopback only ever records the default one.
+// It is tried first on Windows; if it can't start, or dies mid-call, recording
+// falls back to Electron's default-speaker loopback.
 
 async function startNativeMeetingAudio(ctx) {
   if (!isWindows() || !window.notizli.startNativeMeetingAudio) return null;
@@ -387,7 +388,8 @@ function onNativePcm(bytes) {
 function onNativeEvent(msg) {
   if (!msg || !nativeFeeder) return;
   if (msg.event === "target") {
-    hearing = msg.mode === "app" ? msg.name : "all computer sound";
+    // mode "device": the speaker being recorded, and the call app heard on it.
+    hearing = msg.app ? `${msg.app} on ${msg.name}` : msg.name || "";
     if (!meetingWarning) setBothSidesStatus();
   } else if (msg.event === "exit" && mix && mix.replaceSystem) {
     // Helper died mid-call: continue on Electron's loopback rather than lose
