@@ -28,10 +28,17 @@ jobs:
           base=$(node -p "require('./package.json').version")
           IFS=. read -r maj min pat <<< "$base"
           npm version --no-git-tag-version "$maj.$min.$((pat + 1))-test.${GITHUB_RUN_NUMBER}"
+      - name: Build the meeting-audio helper (Rust)
+        run: cargo build --release --manifest-path native/win-audio-helper/Cargo.toml
       - name: Build Windows installer (not published)
         run: npx electron-builder --win --publish never
       - uses: actions/upload-artifact@v4
         with:
           name: notizli-windows-test-${{ github.run_number }}
           path: dist/*.exe
+          retention-days: 14
+      - uses: actions/upload-artifact@v4
+        with:
+          name: notizli-audio-helper-${{ github.run_number }}
+          path: native/win-audio-helper/target/release/notizli-audio-helper.exe
           retention-days: 14

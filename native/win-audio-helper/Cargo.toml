@@ -1,0 +1,21 @@
+[package]
+name = "notizli-audio-helper"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "notizli-audio-helper"
+path = "src/main.rs"
+
+[dependencies]
+serde_json = "1"
+
+[target.'cfg(windows)'.dependencies]
+wasapi = "0.24"
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true

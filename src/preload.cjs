@@ -18,6 +18,19 @@ contextBridge.exposeInMainWorld("notizli", {
   setRecordingActive: (active) => ipcRenderer.send("recording-active", Boolean(active)),
   // Re-captures meeting audio from the current default output; resolves true on success.
   reconnectMeetingAudio: () => ipcRenderer.invoke("reconnect-meeting-audio"),
+  // Windows: the meeting app's own sound via native/win-audio-helper.
+  startNativeMeetingAudio: () => ipcRenderer.invoke("native-audio-start"),
+  stopNativeMeetingAudio: () => ipcRenderer.invoke("native-audio-stop"),
+  onNativeMeetingAudio: (onPcm, onEvent) => {
+    const pcm = (_e, bytes) => onPcm(bytes);
+    const ev = (_e, msg) => onEvent(msg);
+    ipcRenderer.on("native-audio-pcm", pcm);
+    ipcRenderer.on("native-audio-event", ev);
+    return () => {
+      ipcRenderer.removeListener("native-audio-pcm", pcm);
+      ipcRenderer.removeListener("native-audio-event", ev);
+    };
+  },
   onPaired: (cb) => {
     const handler = (_e, payload) => cb(payload);
     ipcRenderer.on("paired", handler);

@@ -78,6 +78,9 @@ let reconnecting = false;
 let quietWhileTalkingMs = 0;    // see the meter loop
 let lastTick = 0;
 let meetingWarning = false;
+let nativeFeeder = null;        // AudioWorkletNode fed by the Windows helper, when in use
+let pcmCarry = null;            // bytes of a sample split across two IPC chunks
+let hearing = "";               // what the helper reports it is capturing
 let statusResetTimer = null;
 const isWindows = () => platform === "win32";
 
@@ -146,7 +149,7 @@ async function captureSystemAudio() {
  * sys -> mono -> merger input 1 (RIGHT, channel 1)
  * plus one analyser per side, read before the merge, for the level meters.
  */
-function buildStereoMix(ctx, mic, sys) {
+function buildStereoMix(ctx, mic, sysNode) {
   const micMono = toMono(ctx, ctx.createMediaStreamSource(mic));
   // The meeting side goes through a fixed mono node so its source can be
   // swapped mid-recording (see reconnectMeetingAudio) without touching the
@@ -155,7 +158,7 @@ function buildStereoMix(ctx, mic, sys) {
   sysMono.channelCount = 1;
   sysMono.channelCountMode = "explicit";
   sysMono.channelInterpretation = "speakers";
-  let sysSource = ctx.createMediaStreamSource(sys);
+  let sysSource = sysNode;
   sysSource.connect(sysMono);
 
   const micAnalyser = ctx.createAnalyser(); micAnalyser.fftSize = 256;
@@ -184,8 +187,7 @@ function buildStereoMix(ctx, mic, sys) {
   return {
     stream: dest.stream,
     levels: () => ({ mic: rms(micAnalyser, micBuf), remote: rms(sysAnalyser, sysBuf) }),
-    replaceSystem: (stream) => {
-      const next = ctx.createMediaStreamSource(stream);
+    replaceSystem: (next) => {
       next.connect(sysMono);
       sysSource.disconnect();
       sysSource = next;
@@ -239,13 +241,18 @@ function updateMeetingWarning(mic, remote, dt) {
 }
 
 function meetingWarningText() {
+  if (nativeFeeder) {
+    return `Notizli can't hear the meeting — only your microphone. It is listening to ${hearing || "the computer's sound"}; check the call isn't muted in the meeting app.`;
+  }
   return isWindows()
     ? "Notizli can't hear the meeting — only your microphone. Make sure the call plays through your Windows default speaker (Teams: Settings → Devices → Speaker: Default)."
     : "Notizli can't hear the meeting — only your microphone. Make sure the call plays through your Mac's current sound output.";
 }
 
 function setBothSidesStatus() {
-  recStatus.textContent = "Both sides captured on separate channels. Uploads when you finish.";
+  recStatus.textContent = hearing
+    ? `Both sides captured — hearing ${hearing}. Uploads when you finish.`
+    : "Both sides captured on separate channels. Uploads when you finish.";
   recStatus.className = "ok-text";
 }
 
@@ -293,7 +300,8 @@ function onDeviceChange() {
   void listDevices();
   // Proven on Windows (WASAPI loopback). macOS captures through ScreenCaptureKit,
   // which is not tied to an output device, so it is left alone there.
-  if (!isWindows() || !mix || !mix.replaceSystem) return;
+  // The native helper follows the meeting app on any device by itself.
+  if (!isWindows() || nativeFeeder || !mix || !mix.replaceSystem) return;
   clearTimeout(reconnectTimer);
   // Windows fires several events while a device comes and goes; the new
   // default is only settled once they stop.
@@ -318,7 +326,7 @@ window.__notizliReconnectMeetingAudio = async () => {
       return false;
     }
     const prev = systemStream;
-    mix.replaceSystem(next);
+    mix.replaceSystem(audioCtx.createMediaStreamSource(next));
     systemStream = next;
     if (prev) prev.getTracks().forEach((t) => t.stop());
     defaultOutput = await currentDefaultOutput();
@@ -327,6 +335,74 @@ window.__notizliReconnectMeetingAudio = async () => {
     reconnecting = false;
   }
 };
+
+// ---- Windows: the meeting app's own sound ------------------------------------
+//
+// native/win-audio-helper captures the call app's process tree (Teams, Zoom,
+// Webex, Slack, WhatsApp, then browsers, else everything but Notizli) whatever
+// speaker it plays on. It is tried first on Windows; if it can't start, or dies
+// mid-call, recording falls back to Electron's default-speaker loopback.
+
+async function startNativeMeetingAudio(ctx) {
+  if (!isWindows() || !window.notizli.startNativeMeetingAudio) return null;
+  try {
+    await ctx.audioWorklet.addModule("./pcm-feeder.js");
+  } catch {
+    return null;
+  }
+  const node = new AudioWorkletNode(ctx, "pcm-feeder", {
+    numberOfInputs: 0,
+    numberOfOutputs: 1,
+    outputChannelCount: [1],
+  });
+  nativeFeeder = node;
+  pcmCarry = null;
+  hearing = "";
+  const r = await window.notizli.startNativeMeetingAudio().catch(() => ({ ok: false }));
+  if (!r || !r.ok) {
+    nativeFeeder = null;
+    node.disconnect();
+    return null;
+  }
+  return node;
+}
+
+function onNativePcm(bytes) {
+  if (!nativeFeeder) return;
+  let u8 = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+  if (pcmCarry) {
+    const joined = new Uint8Array(pcmCarry.length + u8.length);
+    joined.set(pcmCarry, 0);
+    joined.set(u8, pcmCarry.length);
+    u8 = joined;
+    pcmCarry = null;
+  }
+  const whole = u8.length - (u8.length % 4);
+  if (whole < u8.length) pcmCarry = u8.slice(whole);
+  if (!whole) return;
+  const samples = new Float32Array(u8.slice(0, whole).buffer);
+  nativeFeeder.port.postMessage(samples, [samples.buffer]);
+}
+
+function onNativeEvent(msg) {
+  if (!msg || !nativeFeeder) return;
+  if (msg.event === "target") {
+    hearing = msg.mode === "app" ? msg.name : "all computer sound";
+    if (!meetingWarning) setBothSidesStatus();
+  } else if (msg.event === "exit" && mix && mix.replaceSystem) {
+    // Helper died mid-call: continue on Electron's loopback rather than lose
+    // the meeting side for the rest of the recording.
+    const dead = nativeFeeder;
+    nativeFeeder = null;
+    hearing = "";
+    void window.notizli.reconnectMeetingAudio().then((ok) => {
+      if (dead) dead.disconnect();
+      flashStatus(ok ? "Meeting audio switched to the default speaker." : "Meeting audio lost — recording your microphone.");
+    });
+  }
+}
+
+if (window.notizli.onNativeMeetingAudio) window.notizli.onNativeMeetingAudio(onNativePcm, onNativeEvent);
 
 function flashStatus(text) {
   if (meetingWarning) return;
@@ -367,15 +443,21 @@ async function startRecording() {
   }
   void listDevices();
 
-  systemStream = await captureSystemAudio();
-  defaultOutput = await currentDefaultOutput();
   quietWhileTalkingMs = 0;
   meetingWarning = false;
+  // 48 kHz to match the helper's PCM (and Opus); Chromium resamples the mic.
+  audioCtx = new AudioContext({ sampleRate: 48000 });
 
-  audioCtx = new AudioContext();
-  if (systemStream) {
+  let sysNode = await startNativeMeetingAudio(audioCtx);
+  if (!sysNode) {
+    systemStream = await captureSystemAudio();
+    if (systemStream) sysNode = audioCtx.createMediaStreamSource(systemStream);
+  }
+  defaultOutput = await currentDefaultOutput();
+
+  if (sysNode) {
     channelLayout = "mic_remote";
-    mix = buildStereoMix(audioCtx, micStream, systemStream);
+    mix = buildStereoMix(audioCtx, micStream, sysNode);
     setBothSidesStatus();
     recLabel.textContent = "Recording — both sides";
   } else {
@@ -420,6 +502,11 @@ function teardownAudio() {
   clearTimeout(statusResetTimer);
   [micStream, systemStream].forEach((s) => s && s.getTracks().forEach((t) => t.stop()));
   micStream = systemStream = null;
+  if (nativeFeeder) {
+    nativeFeeder = null;
+    hearing = "";
+    void window.notizli.stopNativeMeetingAudio();
+  }
   if (audioCtx) { audioCtx.close().catch(() => {}); audioCtx = null; }
   mix = null;
 }

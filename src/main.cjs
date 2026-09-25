@@ -2,6 +2,7 @@ const { app, BrowserWindow, ipcMain, Menu, shell, dialog, safeStorage, desktopCa
 const path = require("path");
 const fs = require("fs");
 const crypto = require("crypto");
+const { spawn } = require("child_process");
 const { autoUpdater } = require("electron-updater");
 
 // Where this recorder uploads. Override at build/run time with
@@ -405,6 +406,81 @@ ipcMain.handle("get-status", () => {
     platform: process.platform,
   };
 });
+
+// --- Windows meeting-audio helper -------------------------------------------
+//
+// native/win-audio-helper: records the meeting app's own sound (Windows
+// process loopback) wherever it plays. Electron's "loopback" below can only
+// record the default speaker's mix, and on laptops that came back silent for
+// Teams on the built-in speakers. The helper streams mono f32 PCM at 48 kHz on
+// stdout and JSON events on stderr; closing its stdin stops it.
+
+let audioHelper = null;
+
+function audioHelperPath() {
+  return app.isPackaged
+    ? path.join(process.resourcesPath, "notizli-audio-helper.exe")
+    : path.join(__dirname, "..", "native", "win-audio-helper", "target", "release", "notizli-audio-helper.exe");
+}
+
+function stopAudioHelper() {
+  const child = audioHelper;
+  audioHelper = null;
+  if (!child) return;
+  try { child.stdin.end(); } catch { /* already gone */ }
+  setTimeout(() => { try { child.kill(); } catch { /* already gone */ } }, 1500);
+}
+
+ipcMain.handle("native-audio-start", (e) => new Promise((resolve) => {
+  if (process.platform !== "win32") return resolve({ ok: false, reason: "not-windows" });
+  const exe = audioHelperPath();
+  if (!fs.existsSync(exe)) return resolve({ ok: false, reason: "helper missing" });
+  stopAudioHelper();
+
+  const wc = e.sender;
+  let settled = false;
+  let child;
+  const settle = (r) => {
+    if (settled) return;
+    settled = true;
+    if (!r.ok && audioHelper === child) stopAudioHelper();
+    resolve(r);
+  };
+  try {
+    child = spawn(exe, ["--exclude-pid", String(process.pid)], { windowsHide: true, stdio: ["pipe", "pipe", "pipe"] });
+  } catch (err) {
+    return settle({ ok: false, reason: String(err) });
+  }
+  audioHelper = child;
+
+  child.stdout.on("data", (buf) => { if (!wc.isDestroyed()) wc.send("native-audio-pcm", buf); });
+  let pending = "";
+  child.stderr.on("data", (d) => {
+    pending += d.toString("utf8");
+    let i;
+    while ((i = pending.indexOf("\n")) >= 0) {
+      const line = pending.slice(0, i).trim();
+      pending = pending.slice(i + 1);
+      if (!line) continue;
+      let msg;
+      try { msg = JSON.parse(line); } catch { continue; }
+      if (msg.event === "ready") settle({ ok: true });
+      if (!wc.isDestroyed()) wc.send("native-audio-event", msg);
+    }
+  });
+  child.on("error", (err) => settle({ ok: false, reason: String(err) }));
+  child.on("exit", (code) => {
+    const wasCurrent = audioHelper === child;
+    if (wasCurrent) audioHelper = null;
+    settle({ ok: false, reason: `exited with ${code}` });
+    // Only an unexpected exit matters to the renderer: it falls back.
+    if (wasCurrent && !wc.isDestroyed()) wc.send("native-audio-event", { event: "exit", code });
+  });
+  setTimeout(() => settle({ ok: false, reason: "timeout" }), 4000);
+}));
+
+ipcMain.handle("native-audio-stop", () => stopAudioHelper());
+app.on("will-quit", stopAudioHelper);
 
 // The loopback source is bound to whichever output device was the default when
 // it was captured, and does not follow a later switch (headset unplugged,
